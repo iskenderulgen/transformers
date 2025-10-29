@@ -193,6 +193,46 @@ jobs:
       pr_number: ${{ needs.get-pr-number.outputs.PR_NUMBER }}
     secrets: inherit
 
+  check-outputs:
+    name: Checkout new failures
+    needs: [get-pr-number, model-ci, quantization-ci]
+    permissions:
+      pull-requests: write
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Get `run_models_gpu` job status
+        run: |
+          echo "${{ needs.model-ci.outputs.report }}"
+          echo "${{ needs.quantization-ci.outputs.report }}"
+
+      - name: Post results as PR comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MODEL_REPORT: ${{ needs.model-ci.outputs.report }}
+          QUANT_REPORT: ${{ needs.quantization-ci.outputs.report }}
+        run: |
+          COMMENT_BODY=$(cat <<'EOF'
+          ## CI Results
+          
+          ### Model CI Report
+          \`\`\`json
+          ${{ needs.model-ci.outputs.report }}
+          \`\`\`
+          
+          ### Quantization CI Report
+          \`\`\`json
+          ${{ needs.quantization-ci.outputs.report }}
+          \`\`\`
+          EOF
+          )
+          
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            repos/${{ github.repository }}/issues/${{ needs.get-pr-number.outputs.PR_NUMBER }}/comments \
+            -f body="$COMMENT_BODY"
+
   update_run_status:
     name: Update Check Run Status
     needs: [check-timestamps, create_run, model-ci, quantization-ci]
