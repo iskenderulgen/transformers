@@ -194,10 +194,11 @@ jobs:
     secrets: inherit
 
   check-outputs:
-    name: Checkout new failures
-    needs: [get-pr-number, model-ci, quantization-ci]
+    name: Check new failures
+    needs: [get-pr-number, create_run, model-ci, quantization-ci]
     permissions:
       pull-requests: write
+    if: ${{ always() && needs.create_run.result == 'success' }}
     runs-on: ubuntu-22.04
     steps:
       - name: Get `run_models_gpu` job status
