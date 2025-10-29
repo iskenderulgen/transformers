@@ -51,6 +51,23 @@ from .configuration_bert import BertConfig
 logger = logging.get_logger(__name__)
 
 
+class BertRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self) -> str:
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
+
+
 def load_tf_weights_in_bert(model, config, tf_checkpoint_path):
     """Load tf checkpoints in a pytorch model."""
     try:
@@ -133,9 +150,6 @@ class BertEmbeddings(nn.Module):
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
-        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
-        # any TensorFlow checkpoint file
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
@@ -183,7 +197,6 @@ class BertEmbeddings(nn.Module):
         if self.position_embedding_type == "absolute":
             position_embeddings = self.position_embeddings(position_ids)
             embeddings += position_embeddings
-        embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
 
@@ -429,13 +442,11 @@ class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
 
@@ -494,7 +505,7 @@ class BertAttention(nn.Module):
             output_attentions=output_attentions,
             cache_position=cache_position,
         )
-        attention_output = self.output(self_outputs[0], hidden_states)
+        attention_output = self.output(self_outputs[0])
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
         return outputs
 
@@ -518,13 +529,11 @@ class BertOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
 
@@ -533,6 +542,9 @@ class BertLayer(GradientCheckpointingLayer):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
+        norm_eps = getattr(config, "rms_norm_eps", 1e-6)
+        self.pre_attention_layernorm = BertRMSNorm(config.hidden_size, eps=norm_eps)
+        self.pre_mlp_layernorm = BertRMSNorm(config.hidden_size, eps=norm_eps)
         self.attention = BertAttention(config, layer_idx=layer_idx)
         self.is_decoder = config.is_decoder
         self.add_cross_attention = config.add_cross_attention
@@ -540,6 +552,7 @@ class BertLayer(GradientCheckpointingLayer):
             if not self.is_decoder:
                 raise ValueError(f"{self} should be used as a decoder model if cross attention is added")
             self.crossattention = BertAttention(config, position_embedding_type="absolute", layer_idx=layer_idx)
+            self.pre_cross_attention_layernorm = BertRMSNorm(config.hidden_size, eps=norm_eps)
         self.intermediate = BertIntermediate(config)
         self.output = BertOutput(config)
 
@@ -555,8 +568,10 @@ class BertLayer(GradientCheckpointingLayer):
         output_attentions: Optional[bool] = False,
         cache_position: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor]:
+        residual = hidden_states
+        normed_hidden_states = self.pre_attention_layernorm(hidden_states)
         self_attention_outputs = self.attention(
-            hidden_states,
+            normed_hidden_states,
             attention_mask=attention_mask,
             head_mask=head_mask,
             output_attentions=output_attentions,
@@ -564,6 +579,7 @@ class BertLayer(GradientCheckpointingLayer):
             cache_position=cache_position,
         )
         attention_output = self_attention_outputs[0]
+        hidden_states = residual + attention_output
         outputs = self_attention_outputs[1:]  # add self attentions if we output attention weights
 
         if self.is_decoder and encoder_hidden_states is not None:
@@ -573,8 +589,10 @@ class BertLayer(GradientCheckpointingLayer):
                     " by setting `config.add_cross_attention=True`"
                 )
 
+            residual = hidden_states
+            normed_hidden_states = self.pre_cross_attention_layernorm(hidden_states)
             cross_attention_outputs = self.crossattention(
-                attention_output,
+                normed_hidden_states,
                 attention_mask=encoder_attention_mask,
                 head_mask=head_mask,
                 encoder_hidden_states=encoder_hidden_states,
@@ -582,19 +600,23 @@ class BertLayer(GradientCheckpointingLayer):
                 output_attentions=output_attentions,
                 cache_position=cache_position,
             )
-            attention_output = cross_attention_outputs[0]
+            cross_attention_output = cross_attention_outputs[0]
+            hidden_states = residual + cross_attention_output
             outputs = outputs + cross_attention_outputs[1:]  # add cross attentions if we output attention weights
 
-        layer_output = apply_chunking_to_forward(
-            self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output
+        residual = hidden_states
+        feed_forward_hidden_states = apply_chunking_to_forward(
+            self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, hidden_states
         )
-        outputs = (layer_output,) + outputs
+        hidden_states = residual + feed_forward_hidden_states
+        outputs = (hidden_states,) + outputs
 
         return outputs
 
-    def feed_forward_chunk(self, attention_output):
-        intermediate_output = self.intermediate(attention_output)
-        layer_output = self.output(intermediate_output, attention_output)
+    def feed_forward_chunk(self, hidden_states):
+        normed_hidden_states = self.pre_mlp_layernorm(hidden_states)
+        intermediate_output = self.intermediate(normed_hidden_states)
+        layer_output = self.output(intermediate_output)
         return layer_output
 
 
@@ -850,8 +872,10 @@ class BertModel(BertPreTrainedModel):
         super().__init__(config)
         self.config = config
 
+        norm_eps = getattr(config, "rms_norm_eps", 1e-6)
         self.embeddings = BertEmbeddings(config)
         self.encoder = BertEncoder(config)
+        self.final_layer_norm = BertRMSNorm(config.hidden_size, eps=norm_eps)
 
         self.pooler = BertPooler(config) if add_pooling_layer else None
 
@@ -1011,6 +1035,7 @@ class BertModel(BertPreTrainedModel):
             cache_position=cache_position,
         )
         sequence_output = encoder_outputs[0]
+        sequence_output = self.final_layer_norm(sequence_output)
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
 
         if not return_dict:
