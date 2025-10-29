@@ -513,15 +513,16 @@ class BertAttention(nn.Module):
 class BertIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size)
         if isinstance(config.hidden_act, str):
             self.intermediate_act_fn = ACT2FN[config.hidden_act]
         else:
             self.intermediate_act_fn = config.hidden_act
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        hidden_states = self.dense(hidden_states)
-        hidden_states = self.intermediate_act_fn(hidden_states)
+        gated_hidden_states = self.intermediate_act_fn(self.gate_proj(hidden_states))
+        hidden_states = gated_hidden_states * self.up_proj(hidden_states)
         return hidden_states
 
 
@@ -542,7 +543,7 @@ class BertLayer(GradientCheckpointingLayer):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
-        norm_eps = getattr(config, "rms_norm_eps", 1e-6)
+        norm_eps = getattr(config, "rms_norm_eps", getattr(config, "layer_norm_eps", 1e-6))
         self.pre_attention_layernorm = BertRMSNorm(config.hidden_size, eps=norm_eps)
         self.pre_mlp_layernorm = BertRMSNorm(config.hidden_size, eps=norm_eps)
         self.attention = BertAttention(config, layer_idx=layer_idx)
@@ -872,7 +873,7 @@ class BertModel(BertPreTrainedModel):
         super().__init__(config)
         self.config = config
 
-        norm_eps = getattr(config, "rms_norm_eps", 1e-6)
+        norm_eps = getattr(config, "rms_norm_eps", getattr(config, "layer_norm_eps", 1e-6))
         self.embeddings = BertEmbeddings(config)
         self.encoder = BertEncoder(config)
         self.final_layer_norm = BertRMSNorm(config.hidden_size, eps=norm_eps)

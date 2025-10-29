@@ -15,6 +15,7 @@
 # limitations under the License.
 """BERT model configuration"""
 
+import math
 from collections import OrderedDict
 from collections.abc import Mapping
 
@@ -47,9 +48,10 @@ class BertConfig(PretrainedConfig):
             Number of hidden layers in the Transformer encoder.
         num_attention_heads (`int`, *optional*, defaults to 12):
             Number of attention heads for each attention layer in the Transformer encoder.
-        intermediate_size (`int`, *optional*, defaults to 3072):
-            Dimensionality of the "intermediate" (often named feed-forward) layer in the Transformer encoder.
-        hidden_act (`str` or `Callable`, *optional*, defaults to `"gelu"`):
+        intermediate_size (`int`, *optional*, defaults to `int(8 * hidden_size / 3)`):
+            Dimensionality of the "intermediate" (often named feed-forward) layer in the Transformer encoder. By
+            default this scales the hidden size by approximately 8/3 to match the parameter count of a SwiGLU feed-forward block.
+        hidden_act (`str` or `Callable`, *optional*, defaults to `"silu"`):
             The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
             `"relu"`, `"silu"` and `"gelu_new"` are supported.
         hidden_dropout_prob (`float`, *optional*, defaults to 0.1):
@@ -64,7 +66,9 @@ class BertConfig(PretrainedConfig):
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
         layer_norm_eps (`float`, *optional*, defaults to 1e-12):
-            The epsilon used by the layer normalization layers.
+            Legacy epsilon for the original LayerNorm layers.
+        rms_norm_eps (`float`, *optional*, defaults to 1e-6):
+            The epsilon used by RMSNorm layers.
         position_embedding_type (`str`, *optional*, defaults to `"absolute"`):
             Type of position embedding. Choose one of `"absolute"`, `"relative_key"`, `"relative_key_query"`. For
             positional embeddings use `"absolute"`. For more information on `"relative_key"`, please refer to
@@ -102,14 +106,15 @@ class BertConfig(PretrainedConfig):
         hidden_size=768,
         num_hidden_layers=12,
         num_attention_heads=12,
-        intermediate_size=3072,
-        hidden_act="gelu",
+        intermediate_size=None,
+        hidden_act="silu",
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
         max_position_embeddings=512,
         type_vocab_size=2,
         initializer_range=0.02,
         layer_norm_eps=1e-12,
+        rms_norm_eps=1e-6,
         pad_token_id=0,
         position_embedding_type="absolute",
         use_cache=True,
@@ -122,6 +127,8 @@ class BertConfig(PretrainedConfig):
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
+        if intermediate_size is None:
+            intermediate_size = int(math.ceil((8 * hidden_size) / 3))
         self.hidden_act = hidden_act
         self.intermediate_size = intermediate_size
         self.hidden_dropout_prob = hidden_dropout_prob
@@ -130,6 +137,7 @@ class BertConfig(PretrainedConfig):
         self.type_vocab_size = type_vocab_size
         self.initializer_range = initializer_range
         self.layer_norm_eps = layer_norm_eps
+        self.rms_norm_eps = rms_norm_eps
         self.position_embedding_type = position_embedding_type
         self.use_cache = use_cache
         self.classifier_dropout = classifier_dropout
