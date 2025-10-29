@@ -184,6 +184,7 @@ jobs:
           {
             echo 'report<<EOF'
             cat new_failures_with_bad_commit_${{ inputs.job }}_${{ matrix.run_idx }}.json
+            echo ''  # Force a newline
             echo EOF
           } >> "$GITHUB_OUTPUT"
 
