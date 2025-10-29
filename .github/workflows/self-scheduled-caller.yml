@@ -6,7 +6,7 @@ on:
     - cron: "17 2 * * *"
   push:
     branches:
-      - run_nvidia_ci*
+      - run_slow_v2xxx
   workflow_dispatch:
     inputs:
       prev_workflow_run_id:
@@ -23,7 +23,7 @@ on:
 
 # Used for `push` to easily modify the target workflow runs to compare against
 env:
-    prev_workflow_run_id: ""
+    prev_workflow_run_id: "18811913462"
     other_workflow_run_id: ""
 
 
