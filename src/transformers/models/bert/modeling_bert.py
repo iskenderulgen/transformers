@@ -28,6 +28,7 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from ...activations import ACT2FN
 from ...cache_utils import Cache
 from ...generation import GenerationMixin
+from ...integrations import use_kernel_forward_from_hub
 from ...integrations.flex_attention import compile_friendly_flex_attention
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import (
@@ -50,6 +51,7 @@ from .configuration_bert import BertConfig
 logger = logging.get_logger(__name__)
 
 
+@use_kernel_forward_from_hub("RMSNorm")
 class BertRMSNorm(nn.Module):
     def __init__(self, hidden_size, eps=1e-6):
         super().__init__()
@@ -294,8 +296,8 @@ class BertSelfAttention(nn.Module):
         alibi_bias = -slopes.view(1, self.num_attention_heads, 1, 1) * distance
         alibi_bias = alibi_bias.expand(batch_size, -1, -1, -1)
 
-        mask_bias = 1.0 - attention_mask[:, None, None, :]
-        mask_bias = (mask_bias * torch.finfo(torch.float32).min).to(dtype)
+        mask_penalty = torch.finfo(dtype).min
+        mask_bias = (1.0 - attention_mask[:, None, None, :]) * mask_penalty
         total_bias = alibi_bias + mask_bias
 
         def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
@@ -386,7 +388,7 @@ class BertLayer(GradientCheckpointingLayer):
         super().__init__()
         self.chunk_size_feed_forward = config.chunk_size_feed_forward
         self.seq_len_dim = 1
-        norm_eps = getattr(config, "rms_norm_eps", getattr(config, "layer_norm_eps", 1e-6))
+        norm_eps = getattr(config, "rms_norm_eps", 1e-6)
         self.pre_attention_layernorm = BertRMSNorm(config.hidden_size, eps=norm_eps)
         self.pre_mlp_layernorm = BertRMSNorm(config.hidden_size, eps=norm_eps)
         self.attention = BertAttention(config, layer_idx=layer_idx)
@@ -522,7 +524,8 @@ class BertPredictionHeadTransform(nn.Module):
             self.transform_act_fn = ACT2FN[config.hidden_act]
         else:
             self.transform_act_fn = config.hidden_act
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        norm_eps = getattr(config, "rms_norm_eps", 1e-6)
+        self.LayerNorm = BertRMSNorm(config.hidden_size, eps=norm_eps)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
@@ -641,14 +644,9 @@ class BertForPreTrainingOutput(ModelOutput):
 
 @auto_docstring(
     custom_intro="""
-    The model can behave as an encoder (with only self-attention) as well as a decoder, in which case a layer of
-    cross-attention is added between the self-attention layers, following the architecture described in [Attention is
-    all you need](https://huggingface.co/papers/1706.03762) by Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit,
-    Llion Jones, Aidan N. Gomez, Lukasz Kaiser and Illia Polosukhin.
-
-    To behave as an decoder the model needs to be initialized with the `is_decoder` argument of the configuration set
-    to `True`. To be used in a Seq2Seq model, the model needs to initialized with both `is_decoder` argument and
-    `add_cross_attention` set to `True`; an `encoder_hidden_states` is then expected as an input to the forward pass.
+    Encoder-only BERT variant combining pre-RMSNorm, SwiGLU feed-forward blocks, ALiBi positional biases, and
+    FlexAttention. Decoder mode, cross-attention, caching, head masking, and explicit attention outputs are not
+    supported by design.
     """
 )
 class BertModel(BertPreTrainedModel):
@@ -661,7 +659,7 @@ class BertModel(BertPreTrainedModel):
         if not getattr(config, "use_alibi", True):
             raise ValueError("This BERT variant requires `use_alibi=True`.")
 
-        norm_eps = getattr(config, "rms_norm_eps", getattr(config, "layer_norm_eps", 1e-6))
+        norm_eps = getattr(config, "rms_norm_eps", 1e-6)
         self.embeddings = BertEmbeddings(config)
         self.encoder = BertEncoder(config)
         self.final_layer_norm = BertRMSNorm(config.hidden_size, eps=norm_eps)
