@@ -282,26 +282,31 @@ class BertSelfAttention(nn.Module):
         device = hidden_states.device
         dtype = hidden_states.dtype
 
+        # Convert attention_mask to boolean for efficient conditional checks
         if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), device=device, dtype=dtype)
+            attention_mask = torch.ones((batch_size, seq_length), device=device, dtype=torch.bool)
         elif attention_mask.dim() != 2:
             raise ValueError("Attention mask must be 2D with shape (batch_size, seq_length).")
         else:
-            attention_mask = attention_mask.to(dtype)
+            attention_mask = attention_mask.to(torch.bool)
 
+        # Store only 1D vectors - O(L) memory instead of O(B×H×L²)
+        # This enables training at 2048 tokens and inference at 4096+ without OOM
         slopes = self.alibi_slopes.to(device=device, dtype=dtype)
-        query_positions = torch.arange(seq_length, device=device).view(1, 1, seq_length, 1)
-        key_positions = torch.arange(seq_length, device=device).view(1, 1, 1, seq_length)
-        distance = (key_positions - query_positions).abs()
-        alibi_bias = -slopes.view(1, self.num_attention_heads, 1, 1) * distance
-        alibi_bias = alibi_bias.expand(batch_size, -1, -1, -1)
-
+        query_positions = torch.arange(seq_length, device=device)
+        key_positions = torch.arange(seq_length, device=device)
         mask_penalty = torch.finfo(dtype).min
-        mask_bias = (1.0 - attention_mask[:, None, None, :]) * mask_penalty
-        total_bias = alibi_bias + mask_bias
 
+        # Compute ALiBi bias and mask on-the-fly for each attention score
+        # FlexAttention fuses this computation into the attention kernel
         def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
-            return score + total_bias[batch_idx, head_idx, q_idx, kv_idx]
+            # ALiBi positional bias: -slope × |query_pos - key_pos|
+            position_bias = -slopes[head_idx] * (key_positions[kv_idx] - query_positions[q_idx]).abs()
+
+            # Attention mask: apply large negative value to padded positions
+            mask_bias = mask_penalty if not attention_mask[batch_idx, kv_idx] else 0.0
+
+            return score + position_bias + mask_bias
 
         flex_result = compile_friendly_flex_attention(
             query_states,
