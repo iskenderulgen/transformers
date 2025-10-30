@@ -282,30 +282,22 @@ class BertSelfAttention(nn.Module):
         device = hidden_states.device
         dtype = hidden_states.dtype
 
-        # Convert attention_mask to boolean for efficient conditional checks
         if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length), device=device, dtype=torch.bool)
+            attention_mask = torch.ones((batch_size, seq_length), device=device, dtype=dtype)
         elif attention_mask.dim() != 2:
             raise ValueError("Attention mask must be 2D with shape (batch_size, seq_length).")
         else:
-            attention_mask = attention_mask.to(torch.bool)
+            attention_mask = attention_mask.to(dtype)
 
-        # Store only 1D vectors - O(L) memory instead of O(B×H×L²)
-        # This enables training at 2048 tokens and inference at 4096+ without OOM
         slopes = self.alibi_slopes.to(device=device, dtype=dtype)
-        query_positions = torch.arange(seq_length, device=device)
-        key_positions = torch.arange(seq_length, device=device)
+        query_positions = torch.arange(seq_length, device=device, dtype=dtype)
+        key_positions = torch.arange(seq_length, device=device, dtype=dtype)
         mask_penalty = torch.finfo(dtype).min
+        mask_bias_vector = (1.0 - attention_mask) * mask_penalty
 
-        # Compute ALiBi bias and mask on-the-fly for each attention score
-        # FlexAttention fuses this computation into the attention kernel
         def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
-            # ALiBi positional bias: -slope × |query_pos - key_pos|
             position_bias = -slopes[head_idx] * (key_positions[kv_idx] - query_positions[q_idx]).abs()
-
-            # Attention mask: apply large negative value to padded positions
-            mask_bias = mask_penalty if not attention_mask[batch_idx, kv_idx] else 0.0
-
+            mask_bias = mask_bias_vector[batch_idx, kv_idx]
             return score + position_bias + mask_bias
 
         flex_result = compile_friendly_flex_attention(
