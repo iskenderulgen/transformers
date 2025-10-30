@@ -289,17 +289,19 @@ class BertSelfAttention(nn.Module):
         else:
             attention_mask = attention_mask.to(dtype)
 
-        slopes = self.alibi_slopes.to(device=device, dtype=dtype)
-        query_positions = torch.arange(seq_length, device=device, dtype=dtype)
-        key_positions = torch.arange(seq_length, device=device, dtype=dtype)
+        slopes = self.alibi_slopes.to(device=device, dtype=torch.float32)
+        query_positions = torch.arange(seq_length, device=device, dtype=torch.float32)
+        key_positions = torch.arange(seq_length, device=device, dtype=torch.float32)
         mask_penalty = torch.finfo(dtype).min
         mask_bias_vector = (1.0 - attention_mask) * mask_penalty
 
         def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
-            position_bias = -slopes[head_idx] * (key_positions[kv_idx] - query_positions[q_idx]).abs()
+            relative_position = (key_positions[kv_idx] - query_positions[q_idx]).abs()
+            position_bias = (-slopes[head_idx] * relative_position).to(dtype)
             mask_bias = mask_bias_vector[batch_idx, kv_idx]
             return score + position_bias + mask_bias
 
+        dropout_p = self.dropout if self.training else 0.0
         flex_result = compile_friendly_flex_attention(
             query_states,
             key_states,
@@ -308,6 +310,7 @@ class BertSelfAttention(nn.Module):
             enable_gqa=True,
             scale=self.scaling,
             training=self.training,
+            dropout_p=dropout_p,
         )
 
         if isinstance(flex_result, tuple):
@@ -316,7 +319,6 @@ class BertSelfAttention(nn.Module):
             attn_output = flex_result
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, self.all_head_size)
-        attn_output = nn.functional.dropout(attn_output, p=self.dropout, training=self.training)
         return attn_output, None
 
 
