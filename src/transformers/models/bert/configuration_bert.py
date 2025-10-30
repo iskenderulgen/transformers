@@ -59,8 +59,7 @@ class BertConfig(PretrainedConfig):
         attention_probs_dropout_prob (`float`, *optional*, defaults to 0.1):
             The dropout ratio for the attention probabilities.
         max_position_embeddings (`int`, *optional*, defaults to 512):
-            The maximum sequence length that this model might ever be used with. Typically set this to something large
-            just in case (e.g., 512 or 1024 or 2048).
+            Kept for backward compatibility but unused when ALiBi is active.
         type_vocab_size (`int`, *optional*, defaults to 2):
             The vocabulary size of the `token_type_ids` passed when calling [`BertModel`] or [`TFBertModel`].
         initializer_range (`float`, *optional*, defaults to 0.02):
@@ -69,12 +68,10 @@ class BertConfig(PretrainedConfig):
             Legacy epsilon for the original LayerNorm layers.
         rms_norm_eps (`float`, *optional*, defaults to 1e-6):
             The epsilon used by RMSNorm layers.
-        position_embedding_type (`str`, *optional*, defaults to `"absolute"`):
-            Type of position embedding. Choose one of `"absolute"`, `"relative_key"`, `"relative_key_query"`. For
-            positional embeddings use `"absolute"`. For more information on `"relative_key"`, please refer to
-            [Self-Attention with Relative Position Representations (Shaw et al.)](https://huggingface.co/papers/1803.02155).
-            For more information on `"relative_key_query"`, please refer to *Method 4* in [Improve Transformer Models
-            with Better Relative Position Embeddings (Huang et al.)](https://huggingface.co/papers/2009.13658).
+        use_alibi (`bool`, *optional*, defaults to `True`):
+            Whether to use ALiBi positional biases. When set to `True`, absolute positional embeddings are disabled and
+            attention scores are augmented with head-specific linear biases that extrapolate to arbitrary sequence
+            lengths.
         is_decoder (`bool`, *optional*, defaults to `False`):
             Whether the model is used as a decoder or not. If `False`, the model is used as an encoder.
         use_cache (`bool`, *optional*, defaults to `True`):
@@ -116,7 +113,7 @@ class BertConfig(PretrainedConfig):
         layer_norm_eps=1e-12,
         rms_norm_eps=1e-6,
         pad_token_id=0,
-        position_embedding_type="absolute",
+        use_alibi=True,
         use_cache=True,
         classifier_dropout=None,
         **kwargs,
@@ -138,7 +135,8 @@ class BertConfig(PretrainedConfig):
         self.initializer_range = initializer_range
         self.layer_norm_eps = layer_norm_eps
         self.rms_norm_eps = rms_norm_eps
-        self.position_embedding_type = position_embedding_type
+        self.position_embedding_type = "alibi"
+        self.use_alibi = use_alibi
         self.use_cache = use_cache
         self.classifier_dropout = classifier_dropout
 

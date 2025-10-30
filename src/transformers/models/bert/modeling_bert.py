@@ -26,9 +26,9 @@ from torch import nn
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 
 from ...activations import ACT2FN
-from ...cache_utils import Cache, DynamicCache, EncoderDecoderCache
+from ...cache_utils import Cache
 from ...generation import GenerationMixin
-from ...modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa, _prepare_4d_causal_attention_mask_for_sdpa
+from ...integrations.flex_attention import compile_friendly_flex_attention
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -42,9 +42,8 @@ from ...modeling_outputs import (
     TokenClassifierOutput,
 )
 from ...modeling_utils import PreTrainedModel
-from ...pytorch_utils import apply_chunking_to_forward, find_pruneable_heads_and_indices, prune_linear_layer
+from ...pytorch_utils import apply_chunking_to_forward
 from ...utils import ModelOutput, auto_docstring, logging
-from ...utils.deprecation import deprecate_kwarg
 from .configuration_bert import BertConfig
 
 
@@ -142,300 +141,45 @@ def load_tf_weights_in_bert(model, config, tf_checkpoint_path):
 
 
 class BertEmbeddings(nn.Module):
-    """Construct the embeddings from word, position and token_type embeddings."""
+    """Construct the embeddings from word and token type embeddings. Positional information is provided by ALiBi."""
 
     def __init__(self, config):
         super().__init__()
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
-        self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        # position_ids (1, len position emb) is contiguous in memory and exported when serialized
-        self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
-        self.register_buffer(
-            "position_ids", torch.arange(config.max_position_embeddings).expand((1, -1)), persistent=False
-        )
-        self.register_buffer(
-            "token_type_ids", torch.zeros(self.position_ids.size(), dtype=torch.long), persistent=False
-        )
+        self.register_buffer("token_type_ids", torch.zeros(1, 1, dtype=torch.long), persistent=False)
 
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         token_type_ids: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        past_key_values_length: int = 0,
     ) -> torch.Tensor:
         if input_ids is not None:
             input_shape = input_ids.size()
         else:
             input_shape = inputs_embeds.size()[:-1]
 
-        seq_length = input_shape[1]
-
-        if position_ids is None:
-            position_ids = self.position_ids[:, past_key_values_length : seq_length + past_key_values_length]
-
-        # Setting the token_type_ids to the registered buffer in constructor where it is all zeros, which usually occurs
-        # when its auto-generated, registered buffer helps users when tracing the model without passing token_type_ids, solves
-        # issue #5664
-        if token_type_ids is None:
-            if hasattr(self, "token_type_ids"):
-                buffered_token_type_ids = self.token_type_ids[:, :seq_length]
-                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(input_shape[0], seq_length)
-                token_type_ids = buffered_token_type_ids_expanded
-            else:
-                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
-
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
-        token_type_embeddings = self.token_type_embeddings(token_type_ids)
 
+        if token_type_ids is None:
+            device = inputs_embeds.device
+            seq_length = input_shape[1]
+            if self.token_type_ids.numel() < seq_length:
+                new_token_type_ids = torch.zeros((1, seq_length), dtype=torch.long, device=device)
+                self.register_buffer("token_type_ids", new_token_type_ids, persistent=False)
+            token_type_ids = self.token_type_ids[:, :seq_length].expand(input_shape[0], -1)
+        else:
+            device = inputs_embeds.device
+            token_type_ids = token_type_ids.to(device)
+
+        token_type_embeddings = self.token_type_embeddings(token_type_ids)
         embeddings = inputs_embeds + token_type_embeddings
-        if self.position_embedding_type == "absolute":
-            position_embeddings = self.position_embeddings(position_ids)
-            embeddings += position_embeddings
         embeddings = self.dropout(embeddings)
         return embeddings
-
-
-class BertSelfAttention(nn.Module):
-    def __init__(self, config, position_embedding_type=None, layer_idx=None):
-        super().__init__()
-        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
-            raise ValueError(
-                f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
-                f"heads ({config.num_attention_heads})"
-            )
-
-        self.num_attention_heads = config.num_attention_heads
-        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
-        self.all_head_size = self.num_attention_heads * self.attention_head_size
-
-        self.query = nn.Linear(config.hidden_size, self.all_head_size)
-        self.key = nn.Linear(config.hidden_size, self.all_head_size)
-        self.value = nn.Linear(config.hidden_size, self.all_head_size)
-
-        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
-        self.position_embedding_type = position_embedding_type or getattr(
-            config, "position_embedding_type", "absolute"
-        )
-        if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
-            self.max_position_embeddings = config.max_position_embeddings
-            self.distance_embedding = nn.Embedding(2 * config.max_position_embeddings - 1, self.attention_head_size)
-
-        self.is_decoder = config.is_decoder
-        self.layer_idx = layer_idx
-
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        output_attentions: Optional[bool] = False,
-        cache_position: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor]:
-        batch_size, seq_length, _ = hidden_states.shape
-        query_layer = self.query(hidden_states)
-        query_layer = query_layer.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(
-            1, 2
-        )
-
-        is_updated = False
-        is_cross_attention = encoder_hidden_states is not None
-        if past_key_values is not None:
-            if isinstance(past_key_values, EncoderDecoderCache):
-                is_updated = past_key_values.is_updated.get(self.layer_idx)
-                if is_cross_attention:
-                    # after the first generated id, we can subsequently re-use all key/value_layer from cache
-                    curr_past_key_value = past_key_values.cross_attention_cache
-                else:
-                    curr_past_key_value = past_key_values.self_attention_cache
-            else:
-                curr_past_key_value = past_key_values
-
-        current_states = encoder_hidden_states if is_cross_attention else hidden_states
-        if is_cross_attention and past_key_values is not None and is_updated:
-            # reuse k,v, cross_attentions
-            key_layer = curr_past_key_value.layers[self.layer_idx].keys
-            value_layer = curr_past_key_value.layers[self.layer_idx].values
-        else:
-            key_layer = self.key(current_states)
-            key_layer = key_layer.view(batch_size, -1, self.num_attention_heads, self.attention_head_size).transpose(
-                1, 2
-            )
-            value_layer = self.value(current_states)
-            value_layer = value_layer.view(
-                batch_size, -1, self.num_attention_heads, self.attention_head_size
-            ).transpose(1, 2)
-
-            if past_key_values is not None:
-                # save all key/value_layer to cache to be re-used for fast auto-regressive generation
-                cache_position = cache_position if not is_cross_attention else None
-                key_layer, value_layer = curr_past_key_value.update(
-                    key_layer, value_layer, self.layer_idx, {"cache_position": cache_position}
-                )
-                # set flag that curr layer for cross-attn is already updated so we can re-use in subsequent calls
-                if is_cross_attention and isinstance(past_key_values, EncoderDecoderCache):
-                    past_key_values.is_updated[self.layer_idx] = True
-
-        # Take the dot product between "query" and "key" to get the raw attention scores.
-        attention_scores = torch.matmul(query_layer, key_layer.transpose(-1, -2))
-
-        if self.position_embedding_type == "relative_key" or self.position_embedding_type == "relative_key_query":
-            query_length, key_length = query_layer.shape[2], key_layer.shape[2]
-            if past_key_values is not None:
-                position_ids_l = torch.tensor(key_length - 1, dtype=torch.long, device=hidden_states.device).view(
-                    -1, 1
-                )
-            else:
-                position_ids_l = torch.arange(query_length, dtype=torch.long, device=hidden_states.device).view(-1, 1)
-            position_ids_r = torch.arange(key_length, dtype=torch.long, device=hidden_states.device).view(1, -1)
-            distance = position_ids_l - position_ids_r
-
-            positional_embedding = self.distance_embedding(distance + self.max_position_embeddings - 1)
-            positional_embedding = positional_embedding.to(dtype=query_layer.dtype)  # fp16 compatibility
-
-            if self.position_embedding_type == "relative_key":
-                relative_position_scores = torch.einsum("bhld,lrd->bhlr", query_layer, positional_embedding)
-                attention_scores = attention_scores + relative_position_scores
-            elif self.position_embedding_type == "relative_key_query":
-                relative_position_scores_query = torch.einsum("bhld,lrd->bhlr", query_layer, positional_embedding)
-                relative_position_scores_key = torch.einsum("bhrd,lrd->bhlr", key_layer, positional_embedding)
-                attention_scores = attention_scores + relative_position_scores_query + relative_position_scores_key
-
-        attention_scores = attention_scores / math.sqrt(self.attention_head_size)
-        if attention_mask is not None:
-            # Apply the attention mask is (precomputed for all layers in BertModel forward() function)
-            attention_scores = attention_scores + attention_mask
-
-        # Normalize the attention scores to probabilities.
-        attention_probs = nn.functional.softmax(attention_scores, dim=-1)
-
-        # This is actually dropping out entire tokens to attend to, which might
-        # seem a bit unusual, but is taken from the original Transformer paper.
-        attention_probs = self.dropout(attention_probs)
-
-        # Mask heads if we want to
-        if head_mask is not None:
-            attention_probs = attention_probs * head_mask
-
-        context_layer = torch.matmul(attention_probs, value_layer)
-
-        context_layer = context_layer.permute(0, 2, 1, 3).contiguous()
-        new_context_layer_shape = context_layer.size()[:-2] + (self.all_head_size,)
-        context_layer = context_layer.view(new_context_layer_shape)
-
-        return context_layer, attention_probs
-
-
-class BertSdpaSelfAttention(BertSelfAttention):
-    def __init__(self, config, position_embedding_type=None, layer_idx=None):
-        super().__init__(config, position_embedding_type=position_embedding_type, layer_idx=layer_idx)
-        self.dropout_prob = config.attention_probs_dropout_prob
-
-    # Adapted from BertSelfAttention
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
-    def forward(
-        self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        past_key_values: Optional[Cache] = None,
-        output_attentions: Optional[bool] = False,
-        cache_position: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor]:
-        if self.position_embedding_type != "absolute" or output_attentions or head_mask is not None:
-            # TODO: Improve this warning with e.g. `model.config._attn_implementation = "manual"` once implemented.
-            logger.warning_once(
-                "BertSdpaSelfAttention is used but `torch.nn.functional.scaled_dot_product_attention` does not support "
-                "non-absolute `position_embedding_type` or `output_attentions=True` or `head_mask`. Falling back to "
-                "the manual attention implementation, but specifying the manual implementation will be required from "
-                "Transformers version v5.0.0 onwards. This warning can be removed using the argument "
-                '`attn_implementation="eager"` when loading the model.'
-            )
-            return super().forward(
-                hidden_states,
-                attention_mask,
-                head_mask,
-                encoder_hidden_states,
-                past_key_values,
-                output_attentions,
-                cache_position,
-            )
-
-        bsz, tgt_len, _ = hidden_states.size()
-
-        query_layer = (
-            self.query(hidden_states).view(bsz, -1, self.num_attention_heads, self.attention_head_size).transpose(1, 2)
-        )
-
-        is_updated = False
-        is_cross_attention = encoder_hidden_states is not None
-        current_states = encoder_hidden_states if is_cross_attention else hidden_states
-        if past_key_values is not None:
-            if isinstance(past_key_values, EncoderDecoderCache):
-                is_updated = past_key_values.is_updated.get(self.layer_idx)
-                if is_cross_attention:
-                    # after the first generated id, we can subsequently re-use all key/value_states from cache
-                    curr_past_key_value = past_key_values.cross_attention_cache
-                else:
-                    curr_past_key_value = past_key_values.self_attention_cache
-            else:
-                curr_past_key_value = past_key_values
-
-        current_states = encoder_hidden_states if is_cross_attention else hidden_states
-        if is_cross_attention and past_key_values is not None and is_updated:
-            # reuse k,v, cross_attentions
-            key_layer = curr_past_key_value.layers[self.layer_idx].keys
-            value_layer = curr_past_key_value.layers[self.layer_idx].values
-        else:
-            key_layer = (
-                self.key(current_states)
-                .view(bsz, -1, self.num_attention_heads, self.attention_head_size)
-                .transpose(1, 2)
-            )
-            value_layer = (
-                self.value(current_states)
-                .view(bsz, -1, self.num_attention_heads, self.attention_head_size)
-                .transpose(1, 2)
-            )
-
-            if past_key_values is not None:
-                # save all key/value_layer to cache to be re-used for fast auto-regressive generation
-                cache_position = cache_position if not is_cross_attention else None
-                key_layer, value_layer = curr_past_key_value.update(
-                    key_layer, value_layer, self.layer_idx, {"cache_position": cache_position}
-                )
-                # set flag that curr layer for cross-attn is already updated so we can re-use in subsequent calls
-                if is_cross_attention and isinstance(past_key_values, EncoderDecoderCache):
-                    past_key_values.is_updated[self.layer_idx] = True
-
-        # We dispatch to SDPA's Flash Attention or Efficient kernels via this `is_causal` if statement instead of an inline conditional assignment
-        # in SDPA to support both torch.compile's dynamic shapes and full graph options. An inline conditional prevents dynamic shapes from compiling.
-        # The tgt_len > 1 is necessary to match with AttentionMaskConverter.to_causal_4d that does not create
-        # a causal mask in case tgt_len == 1.
-        is_causal = self.is_decoder and not is_cross_attention and attention_mask is None and tgt_len > 1
-
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            query_layer,
-            key_layer,
-            value_layer,
-            attn_mask=attention_mask,
-            dropout_p=self.dropout_prob if self.training else 0.0,
-            is_causal=is_causal,
-        )
-
-        attn_output = attn_output.transpose(1, 2)
-        attn_output = attn_output.reshape(bsz, tgt_len, self.all_head_size)
-
-        return attn_output, None
 
 
 class BertSelfOutput(nn.Module):
@@ -450,53 +194,153 @@ class BertSelfOutput(nn.Module):
         return hidden_states
 
 
-BERT_SELF_ATTENTION_CLASSES = {
-    "eager": BertSelfAttention,
-    "sdpa": BertSdpaSelfAttention,
-}
-
-
-class BertAttention(nn.Module):
-    def __init__(self, config, position_embedding_type=None, layer_idx=None):
+class BertSelfAttention(nn.Module):
+    def __init__(self, config, layer_idx=None):
         super().__init__()
-        self.self = BERT_SELF_ATTENTION_CLASSES[config._attn_implementation](
-            config,
-            position_embedding_type=position_embedding_type,
-            layer_idx=layer_idx,
-        )
-        self.output = BertSelfOutput(config)
-        self.pruned_heads = set()
+        if config.hidden_size % config.num_attention_heads != 0:
+            raise ValueError(
+                f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
+                f"heads ({config.num_attention_heads})"
+            )
 
-    def prune_heads(self, heads):
-        if len(heads) == 0:
-            return
-        heads, index = find_pruneable_heads_and_indices(
-            heads, self.self.num_attention_heads, self.self.attention_head_size, self.pruned_heads
-        )
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
 
-        # Prune linear layers
-        self.self.query = prune_linear_layer(self.self.query, index)
-        self.self.key = prune_linear_layer(self.self.key, index)
-        self.self.value = prune_linear_layer(self.self.value, index)
-        self.output.dense = prune_linear_layer(self.output.dense, index, dim=1)
+        if self.attention_head_size < 16:
+            raise ValueError(
+                "FlexAttention requires the head dimension to be at least 16. "
+                f"Got hidden_size={config.hidden_size} with num_attention_heads={config.num_attention_heads}, "
+                f"resulting in head_dim={self.attention_head_size}. Increase the hidden size or reduce the number "
+                "of attention heads."
+            )
 
-        # Update hyper params and store pruned heads
-        self.self.num_attention_heads = self.self.num_attention_heads - len(heads)
-        self.self.all_head_size = self.self.attention_head_size * self.self.num_attention_heads
-        self.pruned_heads = self.pruned_heads.union(heads)
+        self.query = nn.Linear(config.hidden_size, self.all_head_size)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+        self.dropout = config.attention_probs_dropout_prob
 
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
+        self.layer_idx = layer_idx
+        slopes = self._build_alibi_slopes(self.num_attention_heads)
+        self.register_buffer("alibi_slopes", slopes, persistent=False)
+        self.scaling = self.attention_head_size**-0.5
+
+    @staticmethod
+    def _build_alibi_slopes(num_heads: int) -> torch.Tensor:
+        def _slopes_power_of_two(power_of_two):
+            start = 2 ** (-(2 ** -(math.log2(power_of_two) - 3)))
+            return torch.pow(start, torch.arange(1, power_of_two + 1, dtype=torch.float32))
+
+        if math.log2(num_heads).is_integer():
+            slopes = _slopes_power_of_two(num_heads)
+        else:
+            closest_power_of_two = 2 ** math.floor(math.log2(num_heads))
+            slopes = _slopes_power_of_two(closest_power_of_two)
+            extra_slopes = _slopes_power_of_two(2 * closest_power_of_two)[0::2][: num_heads - closest_power_of_two]
+            slopes = torch.cat([slopes, extra_slopes], dim=0)
+        return slopes
+
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         cache_position: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor]:
-        self_outputs = self.self(
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if encoder_hidden_states is not None:
+            raise NotImplementedError("Cross-attention is not supported in the ALiBi + Flex attention BERT.")
+        if past_key_values is not None:
+            raise NotImplementedError("Caching is not supported in the ALiBi + Flex attention BERT.")
+        if output_attentions:
+            raise NotImplementedError("Returning attention weights is not supported with FlexAttention backend.")
+        if head_mask is not None:
+            raise NotImplementedError("Head masking is not supported with FlexAttention backend.")
+
+        batch_size, seq_length, _ = hidden_states.shape
+
+        query_states = (
+            self.query(hidden_states)
+            .view(batch_size, seq_length, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        key_states = (
+            self.key(hidden_states)
+            .view(batch_size, seq_length, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        value_states = (
+            self.value(hidden_states)
+            .view(batch_size, seq_length, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+
+        device = hidden_states.device
+        dtype = hidden_states.dtype
+
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length), device=device, dtype=dtype)
+        elif attention_mask.dim() != 2:
+            raise ValueError("Attention mask must be 2D with shape (batch_size, seq_length).")
+        else:
+            attention_mask = attention_mask.to(dtype)
+
+        slopes = self.alibi_slopes.to(device=device, dtype=dtype)
+        query_positions = torch.arange(seq_length, device=device).view(1, 1, seq_length, 1)
+        key_positions = torch.arange(seq_length, device=device).view(1, 1, 1, seq_length)
+        distance = (key_positions - query_positions).abs()
+        alibi_bias = -slopes.view(1, self.num_attention_heads, 1, 1) * distance
+        alibi_bias = alibi_bias.expand(batch_size, -1, -1, -1)
+
+        mask_bias = 1.0 - attention_mask[:, None, None, :]
+        mask_bias = (mask_bias * torch.finfo(torch.float32).min).to(dtype)
+        total_bias = alibi_bias + mask_bias
+
+        def score_mod(score, batch_idx, head_idx, q_idx, kv_idx):
+            return score + total_bias[batch_idx, head_idx, q_idx, kv_idx]
+
+        flex_result = compile_friendly_flex_attention(
+            query_states,
+            key_states,
+            value_states,
+            score_mod=score_mod,
+            enable_gqa=True,
+            scale=self.scaling,
+            training=self.training,
+        )
+
+        if isinstance(flex_result, tuple):
+            attn_output = flex_result[0]
+        else:
+            attn_output = flex_result
+
+        attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, seq_length, self.all_head_size)
+        attn_output = nn.functional.dropout(attn_output, p=self.dropout, training=self.training)
+        return attn_output, None
+
+
+class BertAttention(nn.Module):
+    def __init__(self, config, layer_idx=None):
+        super().__init__()
+        self.self = BertSelfAttention(config, layer_idx=layer_idx)
+        self.output = BertSelfOutput(config)
+
+    def prune_heads(self, heads):
+        raise NotImplementedError("Head pruning is not supported in the ALiBi + Flex attention BERT.")
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        cache_position: Optional[torch.Tensor] = None,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        attention_output, _ = self.self(
             hidden_states,
             attention_mask=attention_mask,
             head_mask=head_mask,
@@ -505,9 +349,8 @@ class BertAttention(nn.Module):
             output_attentions=output_attentions,
             cache_position=cache_position,
         )
-        attention_output = self.output(self_outputs[0])
-        outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
-        return outputs
+        attention_output = self.output(attention_output)
+        return attention_output, None
 
 
 class BertIntermediate(nn.Module):
@@ -547,72 +390,41 @@ class BertLayer(GradientCheckpointingLayer):
         self.pre_attention_layernorm = BertRMSNorm(config.hidden_size, eps=norm_eps)
         self.pre_mlp_layernorm = BertRMSNorm(config.hidden_size, eps=norm_eps)
         self.attention = BertAttention(config, layer_idx=layer_idx)
-        self.is_decoder = config.is_decoder
-        self.add_cross_attention = config.add_cross_attention
-        if self.add_cross_attention:
-            if not self.is_decoder:
-                raise ValueError(f"{self} should be used as a decoder model if cross attention is added")
-            self.crossattention = BertAttention(config, position_embedding_type="absolute", layer_idx=layer_idx)
-            self.pre_cross_attention_layernorm = BertRMSNorm(config.hidden_size, eps=norm_eps)
         self.intermediate = BertIntermediate(config)
         self.output = BertOutput(config)
 
-    @deprecate_kwarg("past_key_value", new_name="past_key_values", version="4.58")
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         cache_position: Optional[torch.Tensor] = None,
-    ) -> tuple[torch.Tensor]:
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if head_mask is not None:
+            raise NotImplementedError("Head masking is not supported in the ALiBi + Flex attention BERT.")
+        if encoder_hidden_states is not None or encoder_attention_mask is not None:
+            raise NotImplementedError("Cross attention is not supported in the ALiBi + Flex attention BERT.")
+        if past_key_values is not None:
+            raise NotImplementedError("Caching is not supported in the ALiBi + Flex attention BERT.")
+        if output_attentions:
+            raise NotImplementedError("Returning attention weights is not supported with FlexAttention backend.")
+
         residual = hidden_states
         normed_hidden_states = self.pre_attention_layernorm(hidden_states)
-        self_attention_outputs = self.attention(
-            normed_hidden_states,
-            attention_mask=attention_mask,
-            head_mask=head_mask,
-            output_attentions=output_attentions,
-            past_key_values=past_key_values,
-            cache_position=cache_position,
-        )
-        attention_output = self_attention_outputs[0]
+        attention_output, _ = self.attention(normed_hidden_states, attention_mask=attention_mask)
         hidden_states = residual + attention_output
-        outputs = self_attention_outputs[1:]  # add self attentions if we output attention weights
-
-        if self.is_decoder and encoder_hidden_states is not None:
-            if not hasattr(self, "crossattention"):
-                raise ValueError(
-                    f"If `encoder_hidden_states` are passed, {self} has to be instantiated with cross-attention layers"
-                    " by setting `config.add_cross_attention=True`"
-                )
-
-            residual = hidden_states
-            normed_hidden_states = self.pre_cross_attention_layernorm(hidden_states)
-            cross_attention_outputs = self.crossattention(
-                normed_hidden_states,
-                attention_mask=encoder_attention_mask,
-                head_mask=head_mask,
-                encoder_hidden_states=encoder_hidden_states,
-                past_key_values=past_key_values,
-                output_attentions=output_attentions,
-                cache_position=cache_position,
-            )
-            cross_attention_output = cross_attention_outputs[0]
-            hidden_states = residual + cross_attention_output
-            outputs = outputs + cross_attention_outputs[1:]  # add cross attentions if we output attention weights
 
         residual = hidden_states
         feed_forward_hidden_states = apply_chunking_to_forward(
             self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, hidden_states
         )
         hidden_states = residual + feed_forward_hidden_states
-        outputs = (hidden_states,) + outputs
 
-        return outputs
+        return hidden_states, None
 
     def feed_forward_chunk(self, hidden_states):
         normed_hidden_states = self.pre_mlp_layernorm(hidden_states)
@@ -631,10 +443,10 @@ class BertEncoder(nn.Module):
     def forward(
         self,
         hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.FloatTensor] = None,
-        head_mask: Optional[torch.FloatTensor] = None,
-        encoder_hidden_states: Optional[torch.FloatTensor] = None,
-        encoder_attention_mask: Optional[torch.FloatTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        head_mask: Optional[torch.Tensor] = None,
+        encoder_hidden_states: Optional[torch.Tensor] = None,
+        encoder_attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
         use_cache: Optional[bool] = None,
         output_attentions: Optional[bool] = False,
@@ -642,72 +454,48 @@ class BertEncoder(nn.Module):
         return_dict: Optional[bool] = True,
         cache_position: Optional[torch.Tensor] = None,
     ) -> Union[tuple[torch.Tensor], BaseModelOutputWithPastAndCrossAttentions]:
+        if head_mask is not None:
+            raise NotImplementedError("Head masking is not supported in the ALiBi + Flex attention BERT.")
+        if encoder_hidden_states is not None or encoder_attention_mask is not None:
+            raise NotImplementedError("Cross attention is not supported in the ALiBi + Flex attention BERT.")
+        if past_key_values is not None or use_cache:
+            raise NotImplementedError("Caching is not supported in the ALiBi + Flex attention BERT.")
+        if output_attentions:
+            raise NotImplementedError("Returning attention weights is not supported with FlexAttention backend.")
+
         all_hidden_states = () if output_hidden_states else None
-        all_self_attentions = () if output_attentions else None
-        all_cross_attentions = () if output_attentions and self.config.add_cross_attention else None
 
-        if self.gradient_checkpointing and self.training:
-            if use_cache:
-                logger.warning_once(
-                    "`use_cache=True` is incompatible with gradient checkpointing. Setting `use_cache=False`..."
-                )
-                use_cache = False
-
-        if use_cache and self.config.is_decoder and past_key_values is None:
-            past_key_values = EncoderDecoderCache(DynamicCache(config=self.config), DynamicCache(config=self.config))
-
-        if use_cache and self.config.is_decoder and isinstance(past_key_values, tuple):
-            logger.warning_once(
-                "Passing a tuple of `past_key_values` is deprecated and will be removed in Transformers v4.58.0. "
-                "You should pass an instance of `EncoderDecoderCache` instead, e.g. "
-                "`past_key_values=EncoderDecoderCache.from_legacy_cache(past_key_values)`."
-            )
-            past_key_values = EncoderDecoderCache.from_legacy_cache(past_key_values)
-
-        for i, layer_module in enumerate(self.layer):
+        for layer_module in self.layer:
             if output_hidden_states:
                 all_hidden_states = all_hidden_states + (hidden_states,)
 
-            layer_head_mask = head_mask[i] if head_mask is not None else None
-
             layer_outputs = layer_module(
                 hidden_states,
-                attention_mask,
-                layer_head_mask,
-                encoder_hidden_states,  # as a positional argument for gradient checkpointing
-                encoder_attention_mask=encoder_attention_mask,
-                past_key_values=past_key_values,
-                output_attentions=output_attentions,
+                attention_mask=attention_mask,
+                head_mask=None,
+                encoder_hidden_states=None,
+                encoder_attention_mask=None,
+                past_key_values=None,
+                output_attentions=False,
                 cache_position=cache_position,
             )
-
             hidden_states = layer_outputs[0]
-            if output_attentions:
-                all_self_attentions = all_self_attentions + (layer_outputs[1],)
-                if self.config.add_cross_attention:
-                    all_cross_attentions = all_cross_attentions + (layer_outputs[2],)
 
         if output_hidden_states:
             all_hidden_states = all_hidden_states + (hidden_states,)
 
         if not return_dict:
-            return tuple(
-                v
-                for v in [
-                    hidden_states,
-                    past_key_values,
-                    all_hidden_states,
-                    all_self_attentions,
-                    all_cross_attentions,
-                ]
-                if v is not None
-            )
+            outputs = (hidden_states,)
+            if output_hidden_states:
+                outputs = outputs + (all_hidden_states,)
+            return outputs
+
         return BaseModelOutputWithPastAndCrossAttentions(
             last_hidden_state=hidden_states,
-            past_key_values=past_key_values,
+            past_key_values=None,
             hidden_states=all_hidden_states,
-            attentions=all_self_attentions,
-            cross_attentions=all_cross_attentions,
+            attentions=None,
+            cross_attentions=None,
         )
 
 
@@ -804,7 +592,8 @@ class BertPreTrainedModel(PreTrainedModel):
     load_tf_weights = load_tf_weights_in_bert
     base_model_prefix = "bert"
     supports_gradient_checkpointing = True
-    _supports_sdpa = True
+    _supports_sdpa = False
+    _supports_flex_attn = True
 
     def _init_weights(self, module):
         """Initialize the weights"""
@@ -866,24 +655,18 @@ class BertModel(BertPreTrainedModel):
     _no_split_modules = ["BertEmbeddings", "BertLayer"]
 
     def __init__(self, config, add_pooling_layer=True):
-        r"""
-        add_pooling_layer (bool, *optional*, defaults to `True`):
-            Whether to add a pooling layer
-        """
         super().__init__(config)
-        self.config = config
+        if getattr(config, "is_decoder", False):
+            raise ValueError("Decoder mode is not supported in the ALiBi + Flex attention BERT.")
+        if not getattr(config, "use_alibi", True):
+            raise ValueError("This BERT variant requires `use_alibi=True`.")
 
         norm_eps = getattr(config, "rms_norm_eps", getattr(config, "layer_norm_eps", 1e-6))
         self.embeddings = BertEmbeddings(config)
         self.encoder = BertEncoder(config)
         self.final_layer_norm = BertRMSNorm(config.hidden_size, eps=norm_eps)
-
         self.pooler = BertPooler(config) if add_pooling_layer else None
 
-        self.attn_implementation = config._attn_implementation
-        self.position_embedding_type = config.position_embedding_type
-
-        # Initialize weights and apply final processing
         self.post_init()
 
     def get_input_embeddings(self):
@@ -892,15 +675,6 @@ class BertModel(BertPreTrainedModel):
     def set_input_embeddings(self, value):
         self.embeddings.word_embeddings = value
 
-    def _prune_heads(self, heads_to_prune):
-        """
-        Prunes heads of the model. heads_to_prune: dict of {layer_num: list of heads to prune in this layer} See base
-        class PreTrainedModel
-        """
-        for layer, heads in heads_to_prune.items():
-            self.encoder.layer[layer].attention.prune_heads(heads)
-
-    @auto_docstring
     def forward(
         self,
         input_ids: Optional[torch.Tensor] = None,
@@ -918,16 +692,25 @@ class BertModel(BertPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
     ) -> Union[tuple[torch.Tensor], BaseModelOutputWithPoolingAndCrossAttentions]:
-        output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
+        if position_ids is not None:
+            raise NotImplementedError("Position ids are not used when ALiBi is enabled.")
+        if head_mask is not None:
+            raise NotImplementedError("Head masking is not supported in the ALiBi + Flex attention BERT.")
+        if encoder_hidden_states is not None or encoder_attention_mask is not None:
+            raise NotImplementedError("Cross attention is not supported in the ALiBi + Flex attention BERT.")
+        if past_key_values is not None or use_cache:
+            raise NotImplementedError("Caching is not supported in the ALiBi + Flex attention BERT.")
+        if cache_position is not None:
+            raise NotImplementedError("`cache_position` is not supported in the ALiBi + Flex attention BERT.")
+
+        output_attentions = output_attentions if output_attentions is not None else False
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
         )
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
-        if self.config.is_decoder:
-            use_cache = use_cache if use_cache is not None else self.config.use_cache
-        else:
-            use_cache = False
+        if output_attentions:
+            raise NotImplementedError("Returning attention weights is not supported with FlexAttention backend.")
 
         if input_ids is not None and inputs_embeds is not None:
             raise ValueError("You cannot specify both input_ids and inputs_embeds at the same time")
@@ -942,113 +725,40 @@ class BertModel(BertPreTrainedModel):
         batch_size, seq_length = input_shape
         device = input_ids.device if input_ids is not None else inputs_embeds.device
 
-        past_key_values_length = 0
-        if past_key_values is not None:
-            past_key_values_length = (
-                past_key_values[0][0].shape[-2]
-                if not isinstance(past_key_values, Cache)
-                else past_key_values.get_seq_length()
-            )
-
-        if token_type_ids is None:
-            if hasattr(self.embeddings, "token_type_ids"):
-                buffered_token_type_ids = self.embeddings.token_type_ids[:, :seq_length]
-                buffered_token_type_ids_expanded = buffered_token_type_ids.expand(batch_size, seq_length)
-                token_type_ids = buffered_token_type_ids_expanded
-            else:
-                token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length), device=device)
+        else:
+            attention_mask = attention_mask.to(device)
 
         embedding_output = self.embeddings(
             input_ids=input_ids,
-            position_ids=position_ids,
             token_type_ids=token_type_ids,
             inputs_embeds=inputs_embeds,
-            past_key_values_length=past_key_values_length,
         )
-
-        if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length + past_key_values_length), device=device)
-
-        use_sdpa_attention_masks = (
-            self.attn_implementation == "sdpa"
-            and self.position_embedding_type == "absolute"
-            and head_mask is None
-            and not output_attentions
-        )
-
-        # Expand the attention mask
-        if use_sdpa_attention_masks and attention_mask.dim() == 2:
-            # Expand the attention mask for SDPA.
-            # [bsz, seq_len] -> [bsz, 1, seq_len, seq_len]
-            if self.config.is_decoder:
-                extended_attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-                    attention_mask,
-                    input_shape,
-                    embedding_output,
-                    past_key_values_length,
-                )
-            else:
-                extended_attention_mask = _prepare_4d_attention_mask_for_sdpa(
-                    attention_mask, embedding_output.dtype, tgt_len=seq_length
-                )
-        else:
-            # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
-            # ourselves in which case we just need to make it broadcastable to all heads.
-            extended_attention_mask = self.get_extended_attention_mask(attention_mask, input_shape)
-
-        # If a 2D or 3D attention mask is provided for the cross-attention
-        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
-        if self.config.is_decoder and encoder_hidden_states is not None:
-            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
-            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
-            if encoder_attention_mask is None:
-                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
-
-            if use_sdpa_attention_masks and encoder_attention_mask.dim() == 2:
-                # Expand the attention mask for SDPA.
-                # [bsz, seq_len] -> [bsz, 1, seq_len, seq_len]
-                encoder_extended_attention_mask = _prepare_4d_attention_mask_for_sdpa(
-                    encoder_attention_mask, embedding_output.dtype, tgt_len=seq_length
-                )
-            else:
-                encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
-        else:
-            encoder_extended_attention_mask = None
-
-        # Prepare head mask if needed
-        # 1.0 in head_mask indicate we keep the head
-        # attention_probs has shape bsz x n_heads x N x N
-        # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
-        # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
-        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
 
         encoder_outputs = self.encoder(
             embedding_output,
-            attention_mask=extended_attention_mask,
-            head_mask=head_mask,
-            encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_extended_attention_mask,
-            past_key_values=past_key_values,
-            use_cache=use_cache,
-            output_attentions=output_attentions,
+            attention_mask=attention_mask,
             output_hidden_states=output_hidden_states,
-            return_dict=return_dict,
-            cache_position=cache_position,
+            return_dict=True,
         )
-        sequence_output = encoder_outputs[0]
-        sequence_output = self.final_layer_norm(sequence_output)
+
+        sequence_output = self.final_layer_norm(encoder_outputs.last_hidden_state)
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
 
         if not return_dict:
-            return (sequence_output, pooled_output) + encoder_outputs[1:]
+            outputs = (sequence_output, pooled_output)
+            if output_hidden_states:
+                outputs = outputs + (encoder_outputs.hidden_states,)
+            return outputs
 
         return BaseModelOutputWithPoolingAndCrossAttentions(
             last_hidden_state=sequence_output,
             pooler_output=pooled_output,
-            past_key_values=encoder_outputs.past_key_values,
+            past_key_values=None,
             hidden_states=encoder_outputs.hidden_states,
-            attentions=encoder_outputs.attentions,
-            cross_attentions=encoder_outputs.cross_attentions,
+            attentions=None,
+            cross_attentions=None,
         )
 
 
