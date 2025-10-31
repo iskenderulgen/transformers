@@ -56,8 +56,9 @@ class BertConfig(PretrainedConfig):
             `"relu"`, `"silu"` and `"gelu_new"` are supported.
         hidden_dropout_prob (`float`, *optional*, defaults to 0.1):
             The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
-        attention_probs_dropout_prob (`float`, *optional*, defaults to 0.1):
-            The dropout ratio for the attention probabilities.
+        attention_probs_dropout_prob (`float`, *optional*, defaults to 0.0):
+            The dropout ratio for the attention probabilities. Note: FlexAttention does not support attention
+            dropout, so this parameter is ignored in this BERT variant. Keep at 0.0.
         max_position_embeddings (`int`, *optional*, defaults to 512):
             Kept for backward compatibility but unused when ALiBi is active.
         type_vocab_size (`int`, *optional*, defaults to 2):
@@ -106,7 +107,7 @@ class BertConfig(PretrainedConfig):
         intermediate_size=None,
         hidden_act="silu",
         hidden_dropout_prob=0.1,
-        attention_probs_dropout_prob=0.1,
+        attention_probs_dropout_prob=0.0,
         max_position_embeddings=512,
         type_vocab_size=2,
         initializer_range=0.02,

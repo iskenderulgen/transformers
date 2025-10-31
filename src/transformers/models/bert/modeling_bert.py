@@ -217,10 +217,16 @@ class BertSelfAttention(nn.Module):
                 "of attention heads."
             )
 
+        if config.attention_probs_dropout_prob > 0:
+            logger.warning_once(
+                "FlexAttention does not support attention dropout. "
+                f"attention_probs_dropout_prob={config.attention_probs_dropout_prob} will be ignored. "
+                "Set attention_probs_dropout_prob=0.0 in config to suppress this warning."
+            )
+
         self.query = nn.Linear(config.hidden_size, self.all_head_size)
         self.key = nn.Linear(config.hidden_size, self.all_head_size)
         self.value = nn.Linear(config.hidden_size, self.all_head_size)
-        self.dropout = config.attention_probs_dropout_prob
 
         self.layer_idx = layer_idx
         slopes = self._build_alibi_slopes(self.num_attention_heads)
@@ -301,7 +307,6 @@ class BertSelfAttention(nn.Module):
             mask_bias = mask_bias_vector[batch_idx, kv_idx]
             return score + position_bias + mask_bias
 
-        dropout_p = self.dropout if self.training else 0.0
         flex_result = compile_friendly_flex_attention(
             query_states,
             key_states,
@@ -310,7 +315,6 @@ class BertSelfAttention(nn.Module):
             enable_gqa=True,
             scale=self.scaling,
             training=self.training,
-            dropout_p=dropout_p,
         )
 
         if isinstance(flex_result, tuple):
