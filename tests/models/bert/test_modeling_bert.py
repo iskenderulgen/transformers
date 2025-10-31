@@ -182,7 +182,7 @@ class BertTrainingStepTest(unittest.TestCase):
         model = BertModel(config).to(torch_device)
         model.eval()
         input_ids = torch.randint(0, config.vocab_size, (1, 1024), device=torch_device)
-        with torch.cuda.amp.autocast(dtype=torch.float16):
+        with torch.amp.autocast("cuda", dtype=torch.float16):
             outputs = model(input_ids)
         self.assertEqual(outputs.last_hidden_state.shape, (1, 1024, config.hidden_size))
 
