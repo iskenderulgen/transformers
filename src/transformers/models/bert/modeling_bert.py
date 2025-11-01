@@ -656,6 +656,14 @@ class BertModel(BertPreTrainedModel):
     _no_split_modules = ["BertEmbeddings", "BertLayer"]
 
     def __init__(self, config, add_pooling_layer=True):
+        """
+        Args:
+            config (`BertConfig`):
+                Model configuration instance that defines model hyper-parameters.
+            add_pooling_layer (`bool`, *optional*, defaults to `True`):
+                Whether to include the `BertPooler` on top of the encoder outputs. Set to `False` when the pooled
+                representation is not needed.
+        """
         super().__init__(config)
         if getattr(config, "is_decoder", False):
             raise ValueError("Decoder mode is not supported in the ALiBi + Flex attention BERT.")
