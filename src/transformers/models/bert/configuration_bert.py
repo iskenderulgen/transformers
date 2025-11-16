@@ -47,8 +47,10 @@ class BertConfig(PretrainedConfig):
             Number of hidden layers in the Transformer encoder.
         num_attention_heads (`int`, *optional*, defaults to 12):
             Number of attention heads for each attention layer in the Transformer encoder.
-        intermediate_size (`int`, *optional*, defaults to 3072):
-            Dimensionality of the "intermediate" (often named feed-forward) layer in the Transformer encoder.
+        intermediate_size (`int`, *optional*):
+            Dimensionality of the "intermediate" (often named feed-forward) layer in the Transformer encoder. If not
+            provided, it is computed as `(8 / 3) * hidden_size` following the common SwiGLU sizing rule. 
+            This value controls the size of each SwiGLU branch before gating; internally the projection is doubled.
         hidden_act (`str` or `Callable`, *optional*, defaults to `"gelu"`):
             The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
             `"relu"`, `"silu"` and `"gelu_new"` are supported.
@@ -102,7 +104,7 @@ class BertConfig(PretrainedConfig):
         hidden_size=768,
         num_hidden_layers=12,
         num_attention_heads=12,
-        intermediate_size=3072,
+        intermediate_size=None,
         hidden_act="gelu",
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
@@ -123,7 +125,9 @@ class BertConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.hidden_act = hidden_act
-        self.intermediate_size = intermediate_size
+        self.intermediate_size = (
+            int((8.0 / 3.0) * hidden_size) if intermediate_size is None else intermediate_size
+        )
         self.hidden_dropout_prob = hidden_dropout_prob
         self.attention_probs_dropout_prob = attention_probs_dropout_prob
         self.max_position_embeddings = max_position_embeddings
