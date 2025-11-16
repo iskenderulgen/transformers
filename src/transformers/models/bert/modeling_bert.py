@@ -133,9 +133,6 @@ class BertEmbeddings(nn.Module):
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
 
-        # self.LayerNorm is not snake-cased to stick with TensorFlow model variable name and be able to load
-        # any TensorFlow checkpoint file
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         # position_ids (1, len position emb) is contiguous in memory and exported when serialized
         self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
@@ -183,7 +180,6 @@ class BertEmbeddings(nn.Module):
         if self.position_embedding_type == "absolute":
             position_embeddings = self.position_embeddings(position_ids)
             embeddings += position_embeddings
-        embeddings = self.LayerNorm(embeddings)
         embeddings = self.dropout(embeddings)
         return embeddings
 
@@ -429,13 +425,11 @@ class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
 
@@ -494,7 +488,7 @@ class BertAttention(nn.Module):
             output_attentions=output_attentions,
             cache_position=cache_position,
         )
-        attention_output = self.output(self_outputs[0], hidden_states)
+        attention_output = self.output(self_outputs[0])
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
         return outputs
 
@@ -518,13 +512,11 @@ class BertOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size)
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, hidden_states: torch.Tensor, input_tensor: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.dropout(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states + input_tensor)
         return hidden_states
 
 
@@ -536,10 +528,15 @@ class BertLayer(GradientCheckpointingLayer):
         self.attention = BertAttention(config, layer_idx=layer_idx)
         self.is_decoder = config.is_decoder
         self.add_cross_attention = config.add_cross_attention
+        self.attention_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.output_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         if self.add_cross_attention:
             if not self.is_decoder:
                 raise ValueError(f"{self} should be used as a decoder model if cross attention is added")
             self.crossattention = BertAttention(config, position_embedding_type="absolute", layer_idx=layer_idx)
+            self.crossattention_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        else:
+            self.crossattention_rmsnorm = None
         self.intermediate = BertIntermediate(config)
         self.output = BertOutput(config)
 
@@ -555,15 +552,16 @@ class BertLayer(GradientCheckpointingLayer):
         output_attentions: Optional[bool] = False,
         cache_position: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor]:
+        normed_hidden_states = self.attention_rmsnorm(hidden_states)
         self_attention_outputs = self.attention(
-            hidden_states,
+            normed_hidden_states,
             attention_mask=attention_mask,
             head_mask=head_mask,
             output_attentions=output_attentions,
             past_key_values=past_key_values,
             cache_position=cache_position,
         )
-        attention_output = self_attention_outputs[0]
+        attention_output = hidden_states + self_attention_outputs[0]
         outputs = self_attention_outputs[1:]  # add self attentions if we output attention weights
 
         if self.is_decoder and encoder_hidden_states is not None:
@@ -573,8 +571,10 @@ class BertLayer(GradientCheckpointingLayer):
                     " by setting `config.add_cross_attention=True`"
                 )
 
+            cross_attention_input = self.crossattention_rmsnorm(attention_output)
+            residual = attention_output
             cross_attention_outputs = self.crossattention(
-                attention_output,
+                cross_attention_input,
                 attention_mask=encoder_attention_mask,
                 head_mask=head_mask,
                 encoder_hidden_states=encoder_hidden_states,
@@ -582,19 +582,21 @@ class BertLayer(GradientCheckpointingLayer):
                 output_attentions=output_attentions,
                 cache_position=cache_position,
             )
-            attention_output = cross_attention_outputs[0]
+            attention_output = residual + cross_attention_outputs[0]
             outputs = outputs + cross_attention_outputs[1:]  # add cross attentions if we output attention weights
 
+        feed_forward_input = self.output_rmsnorm(attention_output)
         layer_output = apply_chunking_to_forward(
-            self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, attention_output
+            self.feed_forward_chunk, self.chunk_size_feed_forward, self.seq_len_dim, feed_forward_input
         )
-        outputs = (layer_output,) + outputs
+        hidden_states = attention_output + layer_output
+        outputs = (hidden_states,) + outputs
 
         return outputs
 
-    def feed_forward_chunk(self, attention_output):
-        intermediate_output = self.intermediate(attention_output)
-        layer_output = self.output(intermediate_output, attention_output)
+    def feed_forward_chunk(self, feed_forward_input):
+        intermediate_output = self.intermediate(feed_forward_input)
+        layer_output = self.output(intermediate_output)
         return layer_output
 
 
@@ -711,12 +713,12 @@ class BertPredictionHeadTransform(nn.Module):
             self.transform_act_fn = ACT2FN[config.hidden_act]
         else:
             self.transform_act_fn = config.hidden_act
-        self.LayerNorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
         hidden_states = self.transform_act_fn(hidden_states)
-        hidden_states = self.LayerNorm(hidden_states)
+        hidden_states = self.rmsnorm(hidden_states)
         return hidden_states
 
 
@@ -795,8 +797,7 @@ class BertPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.LayerNorm):
-            module.bias.data.zero_()
+        elif isinstance(module, nn.RMSNorm):
             module.weight.data.fill_(1.0)
         elif isinstance(module, BertLMPredictionHead):
             module.bias.data.zero_()
@@ -851,6 +852,7 @@ class BertModel(BertPreTrainedModel):
         self.config = config
 
         self.embeddings = BertEmbeddings(config)
+        self.embeddings_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.encoder = BertEncoder(config)
 
         self.pooler = BertPooler(config) if add_pooling_layer else None
@@ -940,6 +942,7 @@ class BertModel(BertPreTrainedModel):
             inputs_embeds=inputs_embeds,
             past_key_values_length=past_key_values_length,
         )
+        embedding_output = self.embeddings_rmsnorm(embedding_output)
 
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_length + past_key_values_length), device=device)
