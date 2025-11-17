@@ -28,7 +28,7 @@ from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
 from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, EncoderDecoderCache
 from ...generation import GenerationMixin
-from ...modeling_attn_mask_utils import _prepare_4d_attention_mask_for_sdpa, _prepare_4d_causal_attention_mask_for_sdpa
+from ...integrations.flex_attention import BlockMask, flex_attention_forward, make_flex_block_causal_mask
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -421,6 +421,89 @@ class BertSdpaSelfAttention(BertSelfAttention):
         return attn_output, None
 
 
+class BertFlexSelfAttention(nn.Module):
+    def __init__(self, config, position_embedding_type=None, layer_idx=None):
+        super().__init__()
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
+            raise ValueError(
+                f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
+                f"heads ({config.num_attention_heads})"
+            )
+
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+
+        self.query = nn.Linear(config.hidden_size, self.all_head_size)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size)
+
+        self.scaling = self.attention_head_size**-0.5
+        self.dropout_prob = 0.0  # flex_attention_forward does not support dropout
+
+        if config.attention_probs_dropout_prob > 0:
+            logger.warning_once(
+                "Flex attention does not support attention dropout. Setting it to 0.0 for all BERT layers."
+            )
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        cache_position: Optional[torch.Tensor] = None,
+        block_mask: Optional[BlockMask] = None,
+    ) -> tuple[torch.Tensor, None]:
+        if encoder_hidden_states is not None:
+            raise ValueError("Flex attention BERT encoder does not support cross-attention in this variant.")
+        if past_key_values is not None:
+            raise ValueError("Flex attention BERT encoder does not support cached key/values in this variant.")
+
+        bsz, tgt_len, _ = hidden_states.size()
+
+        query_layer = (
+            self.query(hidden_states).view(bsz, tgt_len, self.num_attention_heads, self.attention_head_size).transpose(
+                1, 2
+            )
+        )
+        key_layer = (
+            self.key(hidden_states).view(bsz, tgt_len, self.num_attention_heads, self.attention_head_size).transpose(
+                1, 2
+            )
+        )
+        value_layer = (
+            self.value(hidden_states)
+            .view(bsz, tgt_len, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+
+        if block_mask is None:
+            if attention_mask is None:
+                mask_source = torch.ones((bsz, tgt_len), device=hidden_states.device, dtype=torch.long)
+            else:
+                mask_source = attention_mask.to(dtype=torch.long)
+            block_mask = make_flex_block_causal_mask(
+                mask_source, query_length=tgt_len, key_length=tgt_len, is_causal=False
+            )
+
+        attn_output, _ = flex_attention_forward(
+            self,
+            query_layer,
+            key_layer,
+            value_layer,
+            attention_mask=block_mask,
+            scaling=self.scaling,
+            softcap=None,
+            head_mask=None,
+            dropout=self.dropout_prob,
+        )
+
+        return attn_output, None
+
+
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -434,8 +517,7 @@ class BertSelfOutput(nn.Module):
 
 
 BERT_SELF_ATTENTION_CLASSES = {
-    "eager": BertSelfAttention,
-    "sdpa": BertSdpaSelfAttention,
+    "flex": BertFlexSelfAttention,
 }
 
 
@@ -478,6 +560,7 @@ class BertAttention(nn.Module):
         past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         cache_position: Optional[torch.Tensor] = None,
+        block_mask: Optional[BlockMask] = None,
     ) -> tuple[torch.Tensor]:
         self_outputs = self.self(
             hidden_states,
@@ -487,6 +570,7 @@ class BertAttention(nn.Module):
             past_key_values=past_key_values,
             output_attentions=output_attentions,
             cache_position=cache_position,
+            block_mask=block_mask,
         )
         attention_output = self.output(self_outputs[0])
         outputs = (attention_output,) + self_outputs[1:]  # add attentions if we output them
@@ -548,6 +632,7 @@ class BertLayer(GradientCheckpointingLayer):
         past_key_values: Optional[Cache] = None,
         output_attentions: Optional[bool] = False,
         cache_position: Optional[torch.Tensor] = None,
+        block_mask: Optional[BlockMask] = None,
     ) -> tuple[torch.Tensor]:
         normed_hidden_states = self.attention_rmsnorm(hidden_states)
         self_attention_outputs = self.attention(
@@ -557,6 +642,7 @@ class BertLayer(GradientCheckpointingLayer):
             output_attentions=output_attentions,
             past_key_values=past_key_values,
             cache_position=cache_position,
+            block_mask=block_mask,
         )
         attention_output = hidden_states + self_attention_outputs[0]
         outputs = self_attention_outputs[1:]  # add self attentions if we output attention weights
@@ -617,6 +703,7 @@ class BertEncoder(nn.Module):
         output_hidden_states: Optional[bool] = False,
         return_dict: Optional[bool] = True,
         cache_position: Optional[torch.Tensor] = None,
+        block_mask: Optional[BlockMask] = None,
     ) -> Union[tuple[torch.Tensor], BaseModelOutputWithPastAndCrossAttentions]:
         all_hidden_states = () if output_hidden_states else None
         all_self_attentions = () if output_attentions else None
@@ -655,6 +742,7 @@ class BertEncoder(nn.Module):
                 past_key_values=past_key_values,
                 output_attentions=output_attentions,
                 cache_position=cache_position,
+                block_mask=block_mask,
             )
 
             hidden_states = layer_outputs[0]
@@ -883,6 +971,7 @@ class BertModel(BertPreTrainedModel):
         position_ids: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
+        document_ids: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         past_key_values: Optional[Cache] = None,
@@ -943,72 +1032,40 @@ class BertModel(BertPreTrainedModel):
 
         if attention_mask is None:
             attention_mask = torch.ones((batch_size, seq_length + past_key_values_length), device=device)
+        else:
+            attention_mask = attention_mask.to(device)
 
-        use_sdpa_attention_masks = (
-            self.attn_implementation == "sdpa"
-            and self.position_embedding_type == "absolute"
-            and head_mask is None
-            and not output_attentions
+        if document_ids is not None:
+            doc_mask_source = document_ids.to(device)
+            if doc_mask_source.dim() == 1:
+                doc_mask_source = doc_mask_source.unsqueeze(0)
+            doc_mask_source = doc_mask_source * attention_mask
+        else:
+            doc_mask_source = attention_mask
+        doc_mask_source = doc_mask_source.to(dtype=torch.long)
+
+        block_mask = make_flex_block_causal_mask(
+            doc_mask_source,
+            query_length=seq_length + past_key_values_length,
+            key_length=seq_length + past_key_values_length,
+            is_causal=self.config.is_decoder,
         )
 
-        # Expand the attention mask
-        if use_sdpa_attention_masks and attention_mask.dim() == 2:
-            # Expand the attention mask for SDPA.
-            # [bsz, seq_len] -> [bsz, 1, seq_len, seq_len]
-            if self.config.is_decoder:
-                extended_attention_mask = _prepare_4d_causal_attention_mask_for_sdpa(
-                    attention_mask,
-                    input_shape,
-                    embedding_output,
-                    past_key_values_length,
-                )
-            else:
-                extended_attention_mask = _prepare_4d_attention_mask_for_sdpa(
-                    attention_mask, embedding_output.dtype, tgt_len=seq_length
-                )
-        else:
-            # We can provide a self-attention mask of dimensions [batch_size, from_seq_length, to_seq_length]
-            # ourselves in which case we just need to make it broadcastable to all heads.
-            extended_attention_mask = self.get_extended_attention_mask(attention_mask, input_shape)
-
-        # If a 2D or 3D attention mask is provided for the cross-attention
-        # we need to make broadcastable to [batch_size, num_heads, seq_length, seq_length]
-        if self.config.is_decoder and encoder_hidden_states is not None:
-            encoder_batch_size, encoder_sequence_length, _ = encoder_hidden_states.size()
-            encoder_hidden_shape = (encoder_batch_size, encoder_sequence_length)
-            if encoder_attention_mask is None:
-                encoder_attention_mask = torch.ones(encoder_hidden_shape, device=device)
-
-            if use_sdpa_attention_masks and encoder_attention_mask.dim() == 2:
-                # Expand the attention mask for SDPA.
-                # [bsz, seq_len] -> [bsz, 1, seq_len, seq_len]
-                encoder_extended_attention_mask = _prepare_4d_attention_mask_for_sdpa(
-                    encoder_attention_mask, embedding_output.dtype, tgt_len=seq_length
-                )
-            else:
-                encoder_extended_attention_mask = self.invert_attention_mask(encoder_attention_mask)
-        else:
-            encoder_extended_attention_mask = None
-
-        # Prepare head mask if needed
-        # 1.0 in head_mask indicate we keep the head
-        # attention_probs has shape bsz x n_heads x N x N
-        # input head_mask has shape [num_heads] or [num_hidden_layers x num_heads]
-        # and head_mask is converted to shape [num_hidden_layers x batch x num_heads x seq_length x seq_length]
-        head_mask = self.get_head_mask(head_mask, self.config.num_hidden_layers)
+        head_mask = None
 
         encoder_outputs = self.encoder(
             embedding_output,
-            attention_mask=extended_attention_mask,
+            attention_mask=None,
             head_mask=head_mask,
             encoder_hidden_states=encoder_hidden_states,
-            encoder_attention_mask=encoder_extended_attention_mask,
+            encoder_attention_mask=None,
             past_key_values=past_key_values,
             use_cache=use_cache,
             output_attentions=output_attentions,
             output_hidden_states=output_hidden_states,
             return_dict=return_dict,
             cache_position=cache_position,
+            block_mask=block_mask,
         )
         sequence_output = encoder_outputs[0]
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
