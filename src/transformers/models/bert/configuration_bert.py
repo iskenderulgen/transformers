@@ -49,8 +49,9 @@ class BertConfig(PretrainedConfig):
             Number of attention heads for each attention layer in the Transformer encoder.
         intermediate_size (`int`, *optional*):
             Dimensionality of the "intermediate" (often named feed-forward) layer in the Transformer encoder. If not
-            provided, it is computed as `(8 / 3) * hidden_size` following the common SwiGLU sizing rule. 
-            This value controls the size of each SwiGLU branch before gating; internally the projection is doubled.
+            provided, it is computed as `int((8 / 3) * hidden_size)` following the common SwiGLU sizing rule.
+            For a hidden_size of 768, this defaults to 2048. This value controls the size of both the gate and
+            value projections in the SwiGLU activation.
         hidden_act (`str` or `Callable`, *optional*, defaults to `"gelu"`):
             The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
             `"relu"`, `"silu"` and `"gelu_new"` are supported.
@@ -68,11 +69,9 @@ class BertConfig(PretrainedConfig):
         layer_norm_eps (`float`, *optional*, defaults to 1e-12):
             The epsilon used by the layer normalization layers.
         position_embedding_type (`str`, *optional*, defaults to `"absolute"`):
-            Type of position embedding. Choose one of `"absolute"`, `"relative_key"`, `"relative_key_query"`. For
-            positional embeddings use `"absolute"`. For more information on `"relative_key"`, please refer to
-            [Self-Attention with Relative Position Representations (Shaw et al.)](https://huggingface.co/papers/1803.02155).
-            For more information on `"relative_key_query"`, please refer to *Method 4* in [Improve Transformer Models
-            with Better Relative Position Embeddings (Huang et al.)](https://huggingface.co/papers/2009.13658).
+            Type of position embedding. This modernized BERT variant only supports `"absolute"` position embeddings.
+            Relative position embeddings (`"relative_key"`, `"relative_key_query"`) are not supported due to
+            the use of flex attention.
         is_decoder (`bool`, *optional*, defaults to `False`):
             Whether the model is used as a decoder or not. If `False`, the model is used as an encoder.
         use_cache (`bool`, *optional*, defaults to `True`):
@@ -120,6 +119,14 @@ class BertConfig(PretrainedConfig):
     ):
         super().__init__(pad_token_id=pad_token_id, **kwargs)
 
+        # Validate position embedding type - only absolute is supported in this modernized variant
+        if position_embedding_type != "absolute":
+            raise ValueError(
+                f"This modernized BERT variant only supports 'absolute' position embeddings, "
+                f"got '{position_embedding_type}'. Relative position embeddings are not supported "
+                f"with flex attention."
+            )
+
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
         self.num_hidden_layers = num_hidden_layers
@@ -137,7 +144,7 @@ class BertConfig(PretrainedConfig):
         self.position_embedding_type = position_embedding_type
         self.use_cache = use_cache
         self.classifier_dropout = classifier_dropout
-        self._attn_implementation = "flex"
+        self._attn_implementation = "flex_attention"
 
 
 class BertOnnxConfig(OnnxConfig):
