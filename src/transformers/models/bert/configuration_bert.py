@@ -76,7 +76,7 @@ class BertConfig(PretrainedConfig):
             Relative position embeddings (`"relative_key"`, `"relative_key_query"`) are not supported due to
             the use of flex attention.
         is_decoder (`bool`, *optional*, defaults to `False`):
-            Whether the model is used as a decoder or not. If `False`, the model is used as an encoder.
+            Whether the model is used as a decoder or not. This modernized BERT variant only supports `False` (encoder-only).
         use_cache (`bool`, *optional*, defaults to `True`):
             Whether or not the model should return the last key/values attentions (not used by all models). Only
             relevant if `config.is_decoder=True`.
@@ -122,6 +122,18 @@ class BertConfig(PretrainedConfig):
         **kwargs,
     ):
         super().__init__(pad_token_id=pad_token_id, **kwargs)
+
+        # Validate encoder-only architecture - this variant does not support decoder mode
+        if kwargs.get("is_decoder", False):
+            raise ValueError(
+                "This modernized BERT variant does not support decoder mode (is_decoder=True). "
+                "This implementation is designed for encoder-only use cases."
+            )
+        if kwargs.get("add_cross_attention", False):
+            raise ValueError(
+                "This modernized BERT variant does not support cross-attention (add_cross_attention=True). "
+                "This implementation is designed for encoder-only use cases."
+            )
 
         # Validate position embedding type - only absolute is supported in this modernized variant
         if position_embedding_type != "absolute":
