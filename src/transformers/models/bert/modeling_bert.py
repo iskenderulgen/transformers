@@ -58,79 +58,6 @@ from .configuration_bert import BertConfig
 logger = logging.get_logger(__name__)
 
 
-def load_tf_weights_in_bert(model, config, tf_checkpoint_path):
-    """Load tf checkpoints in a pytorch model."""
-    try:
-        import re
-
-        import numpy as np
-        import tensorflow as tf
-    except ImportError:
-        logger.error(
-            "Loading a TensorFlow model in PyTorch, requires TensorFlow to be installed. Please see "
-            "https://www.tensorflow.org/install/ for installation instructions."
-        )
-        raise
-    tf_path = os.path.abspath(tf_checkpoint_path)
-    logger.info(f"Converting TensorFlow checkpoint from {tf_path}")
-    # Load weights from TF model
-    init_vars = tf.train.list_variables(tf_path)
-    names = []
-    arrays = []
-    for name, shape in init_vars:
-        logger.info(f"Loading TF weight {name} with shape {shape}")
-        array = tf.train.load_variable(tf_path, name)
-        names.append(name)
-        arrays.append(array)
-
-    for name, array in zip(names, arrays):
-        name = name.split("/")
-        # adam_v and adam_m are variables used in AdamWeightDecayOptimizer to calculated m and v
-        # which are not required for using pretrained model
-        if any(
-            n in ["adam_v", "adam_m", "AdamWeightDecayOptimizer", "AdamWeightDecayOptimizer_1", "global_step"]
-            for n in name
-        ):
-            logger.info(f"Skipping {'/'.join(name)}")
-            continue
-        pointer = model
-        for m_name in name:
-            if re.fullmatch(r"[A-Za-z]+_\d+", m_name):
-                scope_names = re.split(r"_(\d+)", m_name)
-            else:
-                scope_names = [m_name]
-            if scope_names[0] == "kernel" or scope_names[0] == "gamma":
-                pointer = getattr(pointer, "weight")
-            elif scope_names[0] == "output_bias" or scope_names[0] == "beta":
-                pointer = getattr(pointer, "bias")
-            elif scope_names[0] == "output_weights":
-                pointer = getattr(pointer, "weight")
-            elif scope_names[0] == "squad":
-                pointer = getattr(pointer, "classifier")
-            else:
-                try:
-                    pointer = getattr(pointer, scope_names[0])
-                except AttributeError:
-                    logger.info(f"Skipping {'/'.join(name)}")
-                    continue
-            if len(scope_names) >= 2:
-                num = int(scope_names[1])
-                pointer = pointer[num]
-        if m_name[-11:] == "_embeddings":
-            pointer = getattr(pointer, "weight")
-        elif m_name == "kernel":
-            array = np.transpose(array)
-        try:
-            if pointer.shape != array.shape:
-                raise ValueError(f"Pointer shape {pointer.shape} and array shape {array.shape} mismatched")
-        except ValueError as e:
-            e.args += (pointer.shape, array.shape)
-            raise
-        logger.info(f"Initialize PyTorch weight {name}")
-        pointer.data = torch.from_numpy(array)
-    return model
-
-
 class BertEmbeddings(nn.Module):
     """Construct the embeddings from word, position and token_type embeddings.
 
@@ -244,17 +171,18 @@ class BertFlexSelfAttention(nn.Module):
         query_layer = (
             self.query(hidden_states).view(bsz, tgt_len, self.num_attention_heads, self.attention_head_size).transpose(
                 1, 2
-            )
+            ).contiguous()
         )
         key_layer = (
             self.key(hidden_states).view(bsz, tgt_len, self.num_attention_heads, self.attention_head_size).transpose(
                 1, 2
-            )
+            ).contiguous()
         )
         value_layer = (
             self.value(hidden_states)
             .view(bsz, tgt_len, self.num_attention_heads, self.attention_head_size)
             .transpose(1, 2)
+            .contiguous()
         )
 
         if block_mask is None:
@@ -655,7 +583,6 @@ class BertPreTrainingHeads(nn.Module):
 @auto_docstring
 class BertPreTrainedModel(PreTrainedModel):
     config: BertConfig
-    load_tf_weights = load_tf_weights_in_bert
     base_model_prefix = "bert"
     supports_gradient_checkpointing = True
     _supports_sdpa = False
@@ -842,14 +769,23 @@ class BertModel(BertPreTrainedModel):
         else:
             attention_mask = attention_mask.to(device)
 
+        # Handle document masking for packed sequences
+        # Per PyTorch FlexAttention blog: document_id indicates which document each token belongs to
+        # The mask_mod in flex_attention checks: document_id[q_idx] == document_id[kv_idx]
+        # Valid tokens must have doc_id > 0, padding must be 0 (so they don't match any valid doc)
         if document_ids is not None:
             doc_mask_source = document_ids.to(device)
             if doc_mask_source.dim() == 1:
                 doc_mask_source = doc_mask_source.unsqueeze(0)
-            doc_mask_source = doc_mask_source * attention_mask
+            doc_mask_source = doc_mask_source.to(dtype=torch.long)
+            
+            # Shift document IDs by 1 so that user's [0, 0, 1, 1] becomes [1, 1, 2, 2]
+            # This ensures doc_id > 0 for all valid documents
+            # Apply attention_mask to set padding positions to 0
+            doc_mask_source = (doc_mask_source + 1) * attention_mask.to(dtype=torch.long)
         else:
-            doc_mask_source = attention_mask
-        doc_mask_source = doc_mask_source.to(dtype=torch.long)
+            # No document_ids: all valid tokens are document 1, padding is 0
+            doc_mask_source = attention_mask.to(dtype=torch.long)
 
         block_mask = make_flex_block_causal_mask(
             doc_mask_source,
@@ -1659,5 +1595,4 @@ __all__ = [
     "BertLMHeadModel",
     "BertModel",
     "BertPreTrainedModel",
-    "load_tf_weights_in_bert",
 ]
