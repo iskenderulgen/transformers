@@ -769,11 +769,12 @@ class BertFlexAttentionTest(unittest.TestCase):
         layer = model.encoder.layer[0]
 
         # SwiGLU should have 2x projections: gate_proj + value_proj
-        gate_params = layer.intermediate.gate_proj.weight.numel() + layer.intermediate.gate_proj.bias.numel()
-        value_params = layer.intermediate.value_proj.weight.numel() + layer.intermediate.value_proj.bias.numel()
+        # Note: Bias is removed in the modernized variant
+        gate_params = layer.intermediate.gate_proj.weight.numel()
+        value_params = layer.intermediate.value_proj.weight.numel()
 
-        # Both should project from hidden_size to intermediate_size
-        expected_per_proj = config.hidden_size * config.intermediate_size + config.intermediate_size
+        # Both should project from hidden_size to intermediate_size (weights only)
+        expected_per_proj = config.hidden_size * config.intermediate_size
         self.assertEqual(gate_params, expected_per_proj)
         self.assertEqual(value_params, expected_per_proj)
 
