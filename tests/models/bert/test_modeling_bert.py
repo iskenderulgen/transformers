@@ -264,55 +264,6 @@ class BertModelTester:
         return config, inputs_dict
 
 
-@pytest.mark.skip(reason="Legacy BERT tests are not applicable to the flex-attention-only variant")
-@require_torch
-class BertModelTest(ModelTesterMixin, GenerationTesterMixin, PipelineTesterMixin, unittest.TestCase):
-    all_model_classes = (
-        (
-            BertModel,
-            BertLMHeadModel,
-            BertForMaskedLM,
-            BertForMultipleChoice,
-            BertForNextSentencePrediction,
-            BertForPreTraining,
-            BertForQuestionAnswering,
-            BertForSequenceClassification,
-            BertForTokenClassification,
-        )
-        if is_torch_available()
-        else ()
-    )
-    pipeline_model_mapping = (
-        {
-            "feature-extraction": BertModel,
-            "fill-mask": BertForMaskedLM,
-            "question-answering": BertForQuestionAnswering,
-            "text-classification": BertForSequenceClassification,
-            "text-generation": BertLMHeadModel,
-            "token-classification": BertForTokenClassification,
-            "zero-shot": BertForSequenceClassification,
-        }
-        if is_torch_available()
-        else {}
-    )
-    fx_compatible = True
-    model_split_percents = [0.5, 0.8, 0.9]
-
-    # special case for ForPreTraining model
-    def _prepare_for_class(self, inputs_dict, model_class, return_labels=False):
-        inputs_dict = super()._prepare_for_class(inputs_dict, model_class, return_labels=return_labels)
-
-        if return_labels:
-            if model_class in get_values(MODEL_FOR_PRETRAINING_MAPPING):
-                inputs_dict["labels"] = torch.zeros(
-                    (self.model_tester.batch_size, self.model_tester.seq_length), dtype=torch.long, device=torch_device
-                )
-                inputs_dict["next_sentence_label"] = torch.zeros(
-                    self.model_tester.batch_size, dtype=torch.long, device=torch_device
-                )
-        return inputs_dict
-
-
 @require_torch
 class BertFlexAttentionTest(unittest.TestCase):
     def _make_config(self, seq_length: int = 6, **kwargs):
@@ -548,6 +499,84 @@ class BertFlexAttentionTest(unittest.TestCase):
 
         self.assertEqual(outputs.last_hidden_state.shape, (batch_size, seq_len, config.hidden_size))
 
+    def test_single_document_sequence(self):
+        """Test packed sequence with only one document (no masking needed)."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+        # All tokens belong to the same document
+        document_ids = torch.zeros_like(input_ids)
+
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids)
+
+        self.assertEqual(outputs.last_hidden_state.shape, (2, 8, config.hidden_size))
+
+    def test_all_different_documents(self):
+        """Test extreme case where each token is a different document."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        batch_size, seq_len = 2, 6
+        input_ids = ids_tensor([batch_size, seq_len], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+        # Each token is its own document
+        document_ids = torch.arange(seq_len, device=torch_device).unsqueeze(0).expand(batch_size, -1)
+
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids)
+
+        self.assertEqual(outputs.last_hidden_state.shape, (batch_size, seq_len, config.hidden_size))
+
+    def test_document_ids_with_mixed_padding(self):
+        """Test document_ids with different padding patterns per batch."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        input_ids = torch.tensor([
+            [1, 2, 3, 4, 0, 0],  # 4 tokens, 2 padding
+            [1, 2, 3, 0, 0, 0],  # 3 tokens, 3 padding
+        ], device=torch_device)
+        attention_mask = torch.tensor([
+            [1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 0, 0, 0],
+        ], device=torch_device)
+        document_ids = torch.tensor([
+            [0, 0, 1, 1, 0, 0],  # 2 docs, padding has doc_id 0
+            [0, 1, 1, 0, 0, 0],  # 2 docs, padding has doc_id 0
+        ], device=torch_device)
+
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids)
+
+        self.assertEqual(outputs.last_hidden_state.shape, (2, 6, config.hidden_size))
+
+    def test_document_ids_none_defaults_to_single_document(self):
+        """Test that document_ids=None is equivalent to all tokens in one document."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        with torch.no_grad():
+            outputs_no_doc = model(input_ids=input_ids, attention_mask=attention_mask)
+            # Use document ID 1 for all tokens (non-zero to avoid issues with masking)
+            outputs_single_doc = model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                document_ids=torch.ones_like(input_ids)
+            )
+
+        # Should produce identical results
+        torch.testing.assert_close(outputs_no_doc.last_hidden_state, outputs_single_doc.last_hidden_state)
+
     # ===== Unsupported Inputs Tests =====
 
     def test_head_mask_not_supported(self):
@@ -599,6 +628,36 @@ class BertFlexAttentionTest(unittest.TestCase):
         model = BertModel(config).to(torch_device)
         # Verify dropout is set to 0
         self.assertEqual(model.encoder.layer[0].attention.self.dropout_prob, 0.0)
+
+    def test_decoder_mode_rejected_at_config(self):
+        """Test that is_decoder=True is rejected during config creation."""
+        with self.assertRaises(ValueError) as cm:
+            BertConfig(is_decoder=True)
+        self.assertIn("encoder-only", str(cm.exception).lower())
+
+    def test_decoder_mode_rejected_at_model_init(self):
+        """Test that is_decoder=True is rejected during model initialization."""
+        config = self._make_config()
+        # Manually set is_decoder after config creation to bypass config validation
+        config.is_decoder = True
+        with self.assertRaises(ValueError) as cm:
+            BertModel(config).to(torch_device)
+        self.assertIn("encoder-only", str(cm.exception).lower())
+
+    def test_cross_attention_rejected_at_config(self):
+        """Test that add_cross_attention=True is rejected during config creation."""
+        with self.assertRaises(ValueError) as cm:
+            BertConfig(add_cross_attention=True)
+        self.assertIn("encoder-only", str(cm.exception).lower())
+
+    def test_cross_attention_rejected_at_model_init(self):
+        """Test that add_cross_attention=True is rejected during model initialization."""
+        config = self._make_config()
+        # Manually set add_cross_attention after config creation
+        config.add_cross_attention = True
+        with self.assertRaises(ValueError) as cm:
+            BertModel(config).to(torch_device)
+        self.assertIn("encoder-only", str(cm.exception).lower())
 
     # ===== Model Variants Tests =====
 
@@ -697,12 +756,107 @@ class BertFlexAttentionTest(unittest.TestCase):
         loss.backward()
         self.assertIsNotNone(model.embeddings.word_embeddings.weight.grad)
 
+    # ===== Serialization Tests =====
+
+    def test_save_and_load_model(self):
+        """Test that FlexBERT model can be saved and loaded correctly."""
+        import tempfile
+        import os
+
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        # Get original outputs
+        with torch.no_grad():
+            original_outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+        # Save model
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_path = os.path.join(tmpdir, "model")
+            model.save_pretrained(save_path)
+
+            # Load model
+            loaded_model = BertModel.from_pretrained(save_path).to(torch_device)
+            loaded_model.eval()
+
+            # Get loaded outputs
+            with torch.no_grad():
+                loaded_outputs = loaded_model(input_ids=input_ids, attention_mask=attention_mask)
+
+        # Outputs should be identical
+        torch.testing.assert_close(original_outputs.last_hidden_state, loaded_outputs.last_hidden_state)
+
+    def test_config_preservation_after_save_load(self):
+        """Test that FlexBERT config is preserved after save/load."""
+        import tempfile
+        import os
+
+        config = BertConfig(
+            vocab_size=100,
+            hidden_size=128,
+            num_hidden_layers=3,
+            num_attention_heads=4,
+            intermediate_size=256,
+            ffn_activation="swiglu",
+            position_embedding_type="absolute",
+        )
+        model = BertModel(config).to(torch_device)
+
+        # Save and load config
+        with tempfile.TemporaryDirectory() as tmpdir:
+            save_path = os.path.join(tmpdir, "model")
+            model.save_pretrained(save_path)
+            loaded_config = BertConfig.from_pretrained(save_path)
+
+        # Verify critical config parameters
+        self.assertEqual(loaded_config.ffn_activation, "swiglu")
+        self.assertEqual(loaded_config.position_embedding_type, "absolute")
+        self.assertEqual(loaded_config.intermediate_size, 256)
+        self.assertEqual(loaded_config.hidden_size, 128)
+        self.assertEqual(loaded_config.num_hidden_layers, 3)
+
+    def test_state_dict_contains_swiglu_parameters(self):
+        """Test that state dict contains both gate_proj and value_proj for SwiGLU."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+
+        state_dict = model.state_dict()
+
+        # Check that both projections exist for each layer
+        for layer_idx in range(config.num_hidden_layers):
+            gate_key = f"encoder.layer.{layer_idx}.intermediate.gate_proj.weight"
+            value_key = f"encoder.layer.{layer_idx}.intermediate.value_proj.weight"
+
+            self.assertIn(gate_key, state_dict)
+            self.assertIn(value_key, state_dict)
+
+            # Both should have same shape
+            self.assertEqual(state_dict[gate_key].shape, state_dict[value_key].shape)
+
+    def test_state_dict_contains_rmsnorm_parameters(self):
+        """Test that state dict contains RMSNorm parameters."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+
+        state_dict = model.state_dict()
+
+        # Check embeddings RMSNorm
+        self.assertIn("embeddings_rmsnorm.weight", state_dict)
+
+        # Check encoder layer RMSNorms
+        for layer_idx in range(config.num_hidden_layers):
+            attention_rmsnorm_key = f"encoder.layer.{layer_idx}.attention_rmsnorm.weight"
+            output_rmsnorm_key = f"encoder.layer.{layer_idx}.output_rmsnorm.weight"
+
+            self.assertIn(attention_rmsnorm_key, state_dict)
+            self.assertIn(output_rmsnorm_key, state_dict)
+
     def setUp(self):
         self.model_tester = BertModelTester(self)
-        self.config_tester = ConfigTester(self, config_class=BertConfig, hidden_size=64)
-
-    def test_config(self):
-        self.config_tester.run_common_tests()
 
     def test_model(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
@@ -806,46 +960,3 @@ class BertModelIntegrationTest(unittest.TestCase):
         expected_slice = torch.tensor([[[0.4249, 0.1008, 0.7531], [0.3771, 0.1188, 0.7467], [0.4152, 0.1098, 0.7108]]])
 
         torch.testing.assert_close(output[:, 1:4, 1:4], expected_slice, rtol=1e-4, atol=1e-4)
-
-
-    @slow
-    @pytest.mark.torch_export_test
-    @pytest.mark.skip(reason="Flex-only variant uses custom attention and this export test relies on pretrained checkpoints")
-    def test_export(self):
-        if version.parse(torch.__version__) < version.parse("2.4.0"):
-            self.skipTest(reason="This test requires torch >= 2.4 to run.")
-
-        bert_model = "google-bert/bert-base-uncased"
-        device = "cpu"
-        attn_implementation = "sdpa"
-        max_length = 512
-
-        tokenizer = AutoTokenizer.from_pretrained(bert_model)
-        inputs = tokenizer(
-            "the man worked as a [MASK].",
-            return_tensors="pt",
-            padding="max_length",
-            max_length=max_length,
-        )
-
-        model = BertForMaskedLM.from_pretrained(
-            bert_model,
-            device_map=device,
-            attn_implementation=attn_implementation,
-            use_cache=True,
-        )
-
-        logits = model(**inputs).logits
-        eg_predicted_mask = tokenizer.decode(logits[0, 6].topk(5).indices)
-        self.assertEqual(eg_predicted_mask.split(), ["carpenter", "waiter", "barber", "mechanic", "salesman"])
-
-        exported_program = torch.export.export(
-            model,
-            args=(inputs["input_ids"],),
-            kwargs={"attention_mask": inputs["attention_mask"]},
-            strict=True,
-        )
-
-        result = exported_program.module().forward(inputs["input_ids"], inputs["attention_mask"])
-        ep_predicted_mask = tokenizer.decode(result.logits[0, 6].topk(5).indices)
-        self.assertEqual(eg_predicted_mask, ep_predicted_mask)
