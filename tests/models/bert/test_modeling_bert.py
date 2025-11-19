@@ -470,7 +470,7 @@ class BertFlexAttentionTest(unittest.TestCase):
 
         input_ids = torch.tensor([[1, 2, 3, 0, 0, 0]], device=torch_device)
         attention_mask = torch.tensor([[1, 1, 1, 0, 0, 0]], device=torch_device)
-        document_ids = torch.tensor([[1, 1, 2, 0, 0, 0]], device=torch_device)
+        document_ids = torch.tensor([[0, 0, 1, -1, -1, -1]], device=torch_device)
 
         with torch.no_grad():
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids)
@@ -547,8 +547,8 @@ class BertFlexAttentionTest(unittest.TestCase):
             [1, 1, 1, 0, 0, 0],
         ], device=torch_device)
         document_ids = torch.tensor([
-            [0, 0, 1, 1, 0, 0],  # 2 docs, padding has doc_id 0
-            [0, 1, 1, 0, 0, 0],  # 2 docs, padding has doc_id 0
+            [0, 0, 1, 1, -1, -1],  # 2 docs, padding has doc_id -1
+            [0, 1, 1, -1, -1, -1],  # 2 docs, padding has doc_id -1
         ], device=torch_device)
 
         with torch.no_grad():
@@ -567,15 +567,72 @@ class BertFlexAttentionTest(unittest.TestCase):
 
         with torch.no_grad():
             outputs_no_doc = model(input_ids=input_ids, attention_mask=attention_mask)
-            # Use document ID 1 for all tokens (non-zero to avoid issues with masking)
+            # Use document ID 0 for all tokens (padding would be -1 if present)
             outputs_single_doc = model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                document_ids=torch.ones_like(input_ids)
+                document_ids=torch.zeros_like(input_ids)
             )
 
         # Should produce identical results
         torch.testing.assert_close(outputs_no_doc.last_hidden_state, outputs_single_doc.last_hidden_state)
+
+    def test_document_masking_independence(self):
+        """
+        Test that document masking prevents cross-document attention.
+        Tokens in different documents should not attend to each other.
+        """
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        # Create a packed sequence with two documents
+        input_ids = torch.tensor([[1, 2, 3, 4]], device=torch_device)
+        attention_mask = torch.ones_like(input_ids)
+        
+        # Test 1: Two separate documents [Doc0, Doc0, Doc1, Doc1]
+        document_ids_split = torch.tensor([[0, 0, 1, 1]], device=torch_device)
+        
+        # Test 2: All tokens in one document [Doc0, Doc0, Doc0, Doc0]
+        document_ids_single = torch.tensor([[0, 0, 0, 0]], device=torch_device)
+
+        with torch.no_grad():
+            out_split = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids_split).last_hidden_state
+            out_single = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids_single).last_hidden_state
+
+        # Outputs should be different because attention patterns differ
+        # With split docs: token[0] can't see token[2,3], token[2] can't see token[0,1]
+        # With single doc: all tokens can see each other
+        self.assertFalse(torch.allclose(out_split, out_single))
+
+    def test_standard_bert_input_behavior(self):
+        """
+        Test that the model behaves correctly with standard [CLS] ... [SEP] input
+        when no document_ids are provided (defaulting to single document).
+        """
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        # [CLS] hello world [SEP] (token ids kept tiny to fit the synthetic vocab)
+        cls_token, hello_token, world_token, sep_token = 1, 5, 6, 2
+        input_ids = torch.tensor([[cls_token, hello_token, world_token, sep_token]], device=torch_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        with torch.no_grad():
+            # Case 1: No document_ids (standard usage)
+            output_default = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+            # Case 2: Explicit single document
+            document_ids = torch.zeros_like(input_ids)
+            output_explicit = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids).last_hidden_state
+
+        # Should be exactly the same
+        torch.testing.assert_close(output_default, output_explicit)
+
+        # Also verify shape and non-NaN
+        self.assertEqual(output_default.shape, (1, 4, config.hidden_size))
+        self.assertFalse(torch.isnan(output_default).any())
 
     # ===== Unsupported Inputs Tests =====
 
@@ -948,6 +1005,17 @@ class BertFlexAttentionTest(unittest.TestCase):
 
 @require_torch
 class BertModelIntegrationTest(unittest.TestCase):
+    def _make_config(self, **kwargs):
+        return BertConfig(
+            vocab_size=128,
+            hidden_size=64,
+            num_hidden_layers=2,
+            num_attention_heads=4,
+            max_position_embeddings=32,
+            attention_probs_dropout_prob=0.0,
+            hidden_dropout_prob=0.0,
+        )
+
     @slow
     def test_inference_no_head_absolute_embedding(self):
         model = BertModel.from_pretrained("google-bert/bert-base-uncased")
@@ -960,3 +1028,54 @@ class BertModelIntegrationTest(unittest.TestCase):
         expected_slice = torch.tensor([[[0.4249, 0.1008, 0.7531], [0.3771, 0.1188, 0.7467], [0.4152, 0.1098, 0.7108]]])
 
         torch.testing.assert_close(output[:, 1:4, 1:4], expected_slice, rtol=1e-4, atol=1e-4)
+
+    def test_packed_sequences_with_special_tokens(self):
+        """
+        Test a realistic packed sequence scenario with [CLS] and [SEP] tokens.
+        Verifies that document masking correctly isolates sequences in packed format:
+        [CLS] A [SEP] [CLS] B [SEP] where each sequence has independent attention.
+        
+        Note: Position IDs are continuous (NOT reset) as per FlexAttention design.
+        Document isolation is achieved through document_ids, not position resets.
+        """
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        # Create a packed sequence: [CLS] 10 11 [SEP] [CLS] 20 21 [SEP]
+        cls_token, sep_token = 1, 2
+        packed_input_ids = torch.tensor([[
+            cls_token, 10, 11, sep_token,  # Doc 0
+            cls_token, 20, 21, sep_token   # Doc 1
+        ]], device=torch_device)
+
+        # Document IDs: [0, 0, 0, 0, 1, 1, 1, 1]
+        packed_doc_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]], device=torch_device)
+        packed_mask = torch.ones_like(packed_input_ids)
+
+        with torch.no_grad():
+            packed_out = model(
+                input_ids=packed_input_ids,
+                attention_mask=packed_mask,
+                document_ids=packed_doc_ids
+            ).last_hidden_state
+
+        # Verify: output shape is correct
+        self.assertEqual(packed_out.shape, (1, 8, config.hidden_size))
+        
+        # Verify: no NaN or inf values
+        self.assertFalse(torch.isnan(packed_out).any())
+        self.assertFalse(torch.isinf(packed_out).any())
+        
+        # Verify: packed execution with different document patterns produces different results
+        # All in one document
+        single_doc_ids = torch.zeros_like(packed_doc_ids)
+        with torch.no_grad():
+            single_out = model(
+                input_ids=packed_input_ids,
+                attention_mask=packed_mask,
+                document_ids=single_doc_ids
+            ).last_hidden_state
+        
+        # Outputs should differ because attention patterns are different
+        self.assertFalse(torch.allclose(packed_out, single_out))
