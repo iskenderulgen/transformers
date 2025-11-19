@@ -737,6 +737,7 @@ class BertModel(BertPreTrainedModel):
         self.embeddings = BertEmbeddings(config)
         self.embeddings_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.encoder = BertEncoder(config)
+        self.final_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         self.pooler = BertPooler(config) if add_pooling_layer else None
 
@@ -874,6 +875,7 @@ class BertModel(BertPreTrainedModel):
             block_mask=block_mask,
         )
         sequence_output = encoder_outputs[0]
+        sequence_output = self.final_rmsnorm(sequence_output)
         pooled_output = self.pooler(sequence_output) if self.pooler is not None else None
 
         if not return_dict:
