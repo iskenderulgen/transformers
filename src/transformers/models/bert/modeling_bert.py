@@ -235,9 +235,9 @@ class BertFlexSelfAttention(nn.Module):
         block_mask: Optional[BlockMask] = None,
     ) -> tuple[torch.Tensor, None]:
         if encoder_hidden_states is not None:
-            raise ValueError("Flex attention BERT encoder does not support cross-attention in this variant.")
+            raise ValueError("This modernized BERT encoder does not support cross-attention.")
         if past_key_values is not None:
-            raise ValueError("Flex attention BERT encoder does not support cached key/values in this variant.")
+            raise ValueError("This modernized BERT encoder does not support cached key/values.")
 
         bsz, tgt_len, _ = hidden_states.size()
 
@@ -303,6 +303,14 @@ BERT_SELF_ATTENTION_CLASSES = {
 class BertAttention(nn.Module):
     def __init__(self, config, position_embedding_type=None, layer_idx=None):
         super().__init__()
+        # Validate position embedding type from config if not explicitly passed
+        pos_emb_type = position_embedding_type if position_embedding_type is not None else config.position_embedding_type
+        if pos_emb_type != "absolute":
+            raise ValueError(
+                f"This modernized BERT variant only supports 'absolute' position embeddings, "
+                f"got '{pos_emb_type}'. Relative position embeddings are not supported with flex attention."
+            )
+
         self.self = BERT_SELF_ATTENTION_CLASSES[config._attn_implementation](
             config,
             position_embedding_type=position_embedding_type,
@@ -359,6 +367,9 @@ class BertAttention(nn.Module):
 class BertIntermediate(nn.Module):
     def __init__(self, config):
         super().__init__()
+        self.ffn_activation = getattr(config, "ffn_activation", "swiglu")
+        if self.ffn_activation != "swiglu":
+            raise ValueError("This modernized BERT variant only supports `ffn_activation='swiglu'`.")
         self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size)
         self.value_proj = nn.Linear(config.hidden_size, config.intermediate_size)
 
@@ -716,6 +727,18 @@ class BertModel(BertPreTrainedModel):
         super().__init__(config)
         self.config = config
 
+        # Validate configuration - this variant implements encoder-only BERT
+        if config.is_decoder:
+            raise ValueError(
+                "This modernized BERT variant does not support decoder mode (is_decoder=True). "
+                "This implementation is designed for encoder-only use cases."
+            )
+        if config.add_cross_attention:
+            raise ValueError(
+                "This modernized BERT variant does not support cross-attention (add_cross_attention=True). "
+                "This implementation is designed for encoder-only use cases."
+            )
+
         self.embeddings = BertEmbeddings(config)
         self.embeddings_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.encoder = BertEncoder(config)
@@ -762,11 +785,13 @@ class BertModel(BertPreTrainedModel):
         cache_position: Optional[torch.Tensor] = None,
     ) -> Union[tuple[torch.Tensor], BaseModelOutputWithPoolingAndCrossAttentions]:
         if encoder_hidden_states is not None or self.config.add_cross_attention or self.config.is_decoder:
-            raise ValueError("Cross-attention/decoder use is not supported in the flex-attention BERT variant.")
+            raise ValueError("Cross-attention/decoder use is not supported in this modernized BERT variant.")
         if use_cache or past_key_values is not None:
-            raise ValueError("Cache/past key values are not supported in the flex-attention BERT variant.")
+            raise ValueError("Cache/past key values are not supported in this modernized BERT variant.")
         if attention_mask is not None and attention_mask.dim() != 2:
-            raise ValueError("Only 2D attention masks are supported in the flex-attention BERT variant.")
+            raise ValueError("Only 2D attention masks are supported in this modernized BERT variant.")
+        if head_mask is not None:
+            raise ValueError("`head_mask` is not supported in this modernized BERT variant.")
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
             output_hidden_states if output_hidden_states is not None else self.config.output_hidden_states
