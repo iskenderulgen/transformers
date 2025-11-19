@@ -706,14 +706,9 @@ class BertForPreTrainingOutput(ModelOutput):
 
 @auto_docstring(
     custom_intro="""
-    The model can behave as an encoder (with only self-attention) as well as a decoder, in which case a layer of
-    cross-attention is added between the self-attention layers, following the architecture described in [Attention is
-    all you need](https://huggingface.co/papers/1706.03762) by Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob Uszkoreit,
-    Llion Jones, Aidan N. Gomez, Lukasz Kaiser and Illia Polosukhin.
+    The model behaves as an encoder (with only self-attention).
 
-    To behave as an decoder the model needs to be initialized with the `is_decoder` argument of the configuration set
-    to `True`. To be used in a Seq2Seq model, the model needs to initialized with both `is_decoder` argument and
-    `add_cross_attention` set to `True`; an `encoder_hidden_states` is then expected as an input to the forward pass.
+    This modernized BERT variant uses Flex Attention and does not support decoder mode or cross-attention.
     """
 )
 class BertModel(BertPreTrainedModel):
@@ -1009,9 +1004,6 @@ class BertLMHeadModel(BertPreTrainedModel, GenerationMixin):
 
     def __init__(self, config):
         super().__init__(config)
-
-        if not config.is_decoder:
-            logger.warning("If you want to use `BertLMHeadModel` as a standalone, add `is_decoder=True.`")
 
         self.bert = BertModel(config, add_pooling_layer=False)
         self.cls = BertOnlyMLMHead(config)
