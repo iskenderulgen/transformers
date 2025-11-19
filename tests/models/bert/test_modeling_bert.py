@@ -308,8 +308,7 @@ class BertFlexAttentionTest(unittest.TestCase):
         # Verify gradients populated throughout the model
         self.assertIsNotNone(model.embeddings.word_embeddings.weight.grad)
         self.assertIsNotNone(model.encoder.layer[0].attention.self.query.weight.grad)
-        self.assertIsNotNone(model.encoder.layer[0].intermediate.gate_proj.weight.grad)
-        self.assertIsNotNone(model.encoder.layer[0].intermediate.value_proj.weight.grad)
+        self.assertIsNotNone(model.encoder.layer[0].intermediate.gate_value_proj.weight.grad)
 
     def test_block_mask_changes_with_documents(self):
         """Test that different document boundaries produce different outputs."""
@@ -352,18 +351,16 @@ class BertFlexAttentionTest(unittest.TestCase):
 
     # ===== SwiGLU Tests =====
 
-    def test_swiglu_has_two_projections(self):
-        """Verify SwiGLU has both gate and value projections."""
+    def test_swiglu_has_packed_projection(self):
+        """Verify SwiGLU has packed gate and value projection."""
         config = self._make_config()
         model = BertModel(config).to(torch_device)
 
         intermediate = model.encoder.layer[0].intermediate
-        self.assertTrue(hasattr(intermediate, 'gate_proj'))
-        self.assertTrue(hasattr(intermediate, 'value_proj'))
+        self.assertTrue(hasattr(intermediate, 'gate_value_proj'))
 
-        # Check both project to intermediate_size
-        self.assertEqual(intermediate.gate_proj.out_features, config.intermediate_size)
-        self.assertEqual(intermediate.value_proj.out_features, config.intermediate_size)
+        # Check projects to 2 * intermediate_size
+        self.assertEqual(intermediate.gate_value_proj.out_features, 2 * config.intermediate_size)
 
     def test_swiglu_output_shape(self):
         """Test SwiGLU intermediate layer output shape."""
@@ -762,21 +759,19 @@ class BertFlexAttentionTest(unittest.TestCase):
     # ===== Parameter Count Tests =====
 
     def test_parameter_count_swiglu(self):
-        """Verify SwiGLU doubles FFN parameters compared to standard FFN."""
+        """Verify SwiGLU parameters (packed)."""
         config = self._make_config()
         model = BertModel(config).to(torch_device)
 
         layer = model.encoder.layer[0]
 
-        # SwiGLU should have 2x projections: gate_proj + value_proj
+        # SwiGLU has packed projection: gate_value_proj
         # Note: Bias is removed in the modernized variant
-        gate_params = layer.intermediate.gate_proj.weight.numel()
-        value_params = layer.intermediate.value_proj.weight.numel()
+        params = layer.intermediate.gate_value_proj.weight.numel()
 
-        # Both should project from hidden_size to intermediate_size (weights only)
-        expected_per_proj = config.hidden_size * config.intermediate_size
-        self.assertEqual(gate_params, expected_per_proj)
-        self.assertEqual(value_params, expected_per_proj)
+        # Should project from hidden_size to 2 * intermediate_size (weights only)
+        expected_params = config.hidden_size * (2 * config.intermediate_size)
+        self.assertEqual(params, expected_params)
 
     # ===== Numerical Stability Tests =====
 
@@ -878,22 +873,16 @@ class BertFlexAttentionTest(unittest.TestCase):
         self.assertEqual(loaded_config.num_hidden_layers, 3)
 
     def test_state_dict_contains_swiglu_parameters(self):
-        """Test that state dict contains both gate_proj and value_proj for SwiGLU."""
+        """Test that state dict contains gate_value_proj for SwiGLU."""
         config = self._make_config()
         model = BertModel(config).to(torch_device)
 
         state_dict = model.state_dict()
 
-        # Check that both projections exist for each layer
+        # Check that packed projection exists for each layer
         for layer_idx in range(config.num_hidden_layers):
-            gate_key = f"encoder.layer.{layer_idx}.intermediate.gate_proj.weight"
-            value_key = f"encoder.layer.{layer_idx}.intermediate.value_proj.weight"
-
-            self.assertIn(gate_key, state_dict)
-            self.assertIn(value_key, state_dict)
-
-            # Both should have same shape
-            self.assertEqual(state_dict[gate_key].shape, state_dict[value_key].shape)
+            key = f"encoder.layer.{layer_idx}.intermediate.gate_value_proj.weight"
+            self.assertIn(key, state_dict)
 
     def test_state_dict_contains_rmsnorm_parameters(self):
         """Test that state dict contains RMSNorm parameters."""

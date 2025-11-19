@@ -20,6 +20,9 @@ This is a modernized BERT implementation with the following improvements:
 - SwiGLU activation in feed-forward layers for better performance
 - Flex Attention for efficient attention computation
 - Absolute position embeddings only (relative position embeddings not supported)
+- Bias-free architecture for improved stability
+- Residual scaling for deep networks (1/sqrt(2L))
+- Packed SwiGLU projections for better performance
 """
 
 import math
@@ -215,6 +218,8 @@ class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
+        # Mark as residual projection for scaled initialization (1/sqrt(2L))
+        self.dense.is_residual = True
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -298,12 +303,14 @@ class BertIntermediate(nn.Module):
         self.ffn_activation = getattr(config, "ffn_activation", "swiglu")
         if self.ffn_activation != "swiglu":
             raise ValueError("This modernized BERT variant only supports `ffn_activation='swiglu'`.")
-        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
-        self.value_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias=False)
+        # Performance optimization: Pack gate and value projections into single linear layer
+        # This reduces kernel launches and improves memory bandwidth utilization
+        self.gate_value_proj = nn.Linear(config.hidden_size, 2 * config.intermediate_size, bias=False)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        gate = self.gate_proj(hidden_states)
-        value = self.value_proj(hidden_states)
+        # Split packed projection into gate and value
+        gate_value = self.gate_value_proj(hidden_states)
+        gate, value = gate_value.chunk(2, dim=-1)
         return nn.functional.silu(gate) * value
 
 
@@ -311,6 +318,8 @@ class BertOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.dense = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
+        # Mark as residual projection for scaled initialization (1/sqrt(2L))
+        self.dense.is_residual = True
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -593,7 +602,15 @@ class BertPreTrainedModel(PreTrainedModel):
         if isinstance(module, nn.Linear):
             # Slightly different from the TF version which uses truncated_normal for initialization
             # cf https://github.com/pytorch/pytorch/pull/5617
-            module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
+            std = self.config.initializer_range
+            
+            # Residual scaling: Scale residual projections by 1/sqrt(2*num_layers)
+            # This improves training stability in deep Pre-Norm networks (critical for 22+ layers)
+            # Following PaLM, GPT-NeoX, and other modern LLMs
+            if getattr(module, "is_residual", False):
+                std = std / math.sqrt(2 * self.config.num_hidden_layers)
+            
+            module.weight.data.normal_(mean=0.0, std=std)
             if module.bias is not None:
                 module.bias.data.zero_()
         elif isinstance(module, nn.Embedding):
