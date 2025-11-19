@@ -53,8 +53,11 @@ class BertConfig(PretrainedConfig):
             For a hidden_size of 768, this defaults to 2048. This value controls the size of both the gate and
             value projections in the SwiGLU activation.
         hidden_act (`str` or `Callable`, *optional*, defaults to `"gelu"`):
-            The non-linear activation function (function or string) in the encoder and pooler. If string, `"gelu"`,
-            `"relu"`, `"silu"` and `"gelu_new"` are supported.
+            The non-linear activation function (function or string) for heads that keep the legacy BERT MLPs (for
+            example, the masked LM head). If string, `"gelu"`, `"relu"`, `"silu"` and `"gelu_new"` are supported.
+        ffn_activation (`str`, *optional*, defaults to `"swiglu"`):
+            Feed-forward activation used inside the encoder. This flex-attention variant is implemented with SwiGLU
+            feed-forward networks and only supports `"swiglu"` here.
         hidden_dropout_prob (`float`, *optional*, defaults to 0.1):
             The dropout probability for all fully connected layers in the embeddings, encoder, and pooler.
         attention_probs_dropout_prob (`float`, *optional*, defaults to 0.1):
@@ -112,6 +115,7 @@ class BertConfig(PretrainedConfig):
         initializer_range=0.02,
         layer_norm_eps=1e-12,
         pad_token_id=0,
+        ffn_activation: str = "swiglu",
         position_embedding_type="absolute",
         use_cache=True,
         classifier_dropout=None,
@@ -132,6 +136,9 @@ class BertConfig(PretrainedConfig):
         self.num_hidden_layers = num_hidden_layers
         self.num_attention_heads = num_attention_heads
         self.hidden_act = hidden_act
+        if ffn_activation != "swiglu":
+            raise ValueError("This modernized BERT variant only supports `ffn_activation='swiglu'`.")
+        self.ffn_activation = ffn_activation
         self.intermediate_size = (
             int((8.0 / 3.0) * hidden_size) if intermediate_size is None else intermediate_size
         )
