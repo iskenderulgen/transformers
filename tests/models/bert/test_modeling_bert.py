@@ -141,32 +141,6 @@ class BertModelTester:
             initializer_range=self.initializer_range,
         )
 
-    def prepare_config_and_inputs_for_decoder(self):
-        (
-            config,
-            input_ids,
-            token_type_ids,
-            input_mask,
-            sequence_labels,
-            token_labels,
-            choice_labels,
-        ) = self.prepare_config_and_inputs()
-
-        config.is_decoder = True
-        encoder_hidden_states = floats_tensor([self.batch_size, self.seq_length, self.hidden_size])
-        encoder_attention_mask = ids_tensor([self.batch_size, self.seq_length], vocab_size=2)
-
-        return (
-            config,
-            input_ids,
-            token_type_ids,
-            input_mask,
-            sequence_labels,
-            token_labels,
-            choice_labels,
-            encoder_hidden_states,
-            encoder_attention_mask,
-        )
 
     def create_and_check_model(
         self, config, input_ids, token_type_ids, input_mask, sequence_labels, token_labels, choice_labels
@@ -180,48 +154,6 @@ class BertModelTester:
         self.parent.assertEqual(result.last_hidden_state.shape, (self.batch_size, self.seq_length, self.hidden_size))
         self.parent.assertEqual(result.pooler_output.shape, (self.batch_size, self.hidden_size))
 
-    def create_and_check_model_as_decoder(
-        self,
-        config,
-        input_ids,
-        token_type_ids,
-        input_mask,
-        sequence_labels,
-        token_labels,
-        choice_labels,
-        encoder_hidden_states,
-        encoder_attention_mask,
-    ):
-        config.add_cross_attention = True
-        model = BertModel(config)
-        model.to(torch_device)
-        model.eval()
-        with self.parent.assertRaises(ValueError):
-            model(
-                input_ids,
-                attention_mask=input_mask,
-                token_type_ids=token_type_ids,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-            )
-
-    def create_and_check_for_causal_lm(
-        self,
-        config,
-        input_ids,
-        token_type_ids,
-        input_mask,
-        sequence_labels,
-        token_labels,
-        choice_labels,
-        encoder_hidden_states,
-        encoder_attention_mask,
-    ):
-        model = BertLMHeadModel(config=config)
-        model.to(torch_device)
-        model.eval()
-        result = model(input_ids, attention_mask=input_mask, token_type_ids=token_type_ids, labels=token_labels)
-        self.parent.assertEqual(result.logits.shape, (self.batch_size, self.seq_length, self.vocab_size))
 
     def create_and_check_for_masked_lm(
         self, config, input_ids, token_type_ids, input_mask, sequence_labels, token_labels, choice_labels
@@ -232,56 +164,6 @@ class BertModelTester:
         result = model(input_ids, attention_mask=input_mask, token_type_ids=token_type_ids, labels=token_labels)
         self.parent.assertEqual(result.logits.shape, (self.batch_size, self.seq_length, self.vocab_size))
 
-    def create_and_check_model_for_causal_lm_as_decoder(
-        self,
-        config,
-        input_ids,
-        token_type_ids,
-        input_mask,
-        sequence_labels,
-        token_labels,
-        choice_labels,
-        encoder_hidden_states,
-        encoder_attention_mask,
-    ):
-        config.add_cross_attention = True
-        model = BertLMHeadModel(config=config)
-        model.to(torch_device)
-        model.eval()
-        with self.parent.assertRaises(ValueError):
-            model(
-                input_ids,
-                attention_mask=input_mask,
-                token_type_ids=token_type_ids,
-                labels=token_labels,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-            )
-
-    def create_and_check_decoder_model_past_large_inputs(
-        self,
-        config,
-        input_ids,
-        token_type_ids,
-        input_mask,
-        sequence_labels,
-        token_labels,
-        choice_labels,
-        encoder_hidden_states,
-        encoder_attention_mask,
-    ):
-        config.is_decoder = True
-        config.add_cross_attention = True
-        model = BertLMHeadModel(config=config).to(torch_device).eval()
-
-        with self.parent.assertRaises(ValueError):
-            model(
-                input_ids,
-                attention_mask=input_mask,
-                encoder_hidden_states=encoder_hidden_states,
-                encoder_attention_mask=encoder_attention_mask,
-                use_cache=True,
-            )
 
     def create_and_check_for_next_sequence_prediction(
         self, config, input_ids, token_type_ids, input_mask, sequence_labels, token_labels, choice_labels
@@ -551,10 +433,16 @@ class BertFlexAttentionTest(unittest.TestCase):
         config = BertConfig(hidden_size=768)
         expected_intermediate = int((8.0 / 3.0) * 768)  # 2048
         self.assertEqual(config.intermediate_size, expected_intermediate)
+        self.assertEqual(config.ffn_activation, "swiglu")
 
         # Test custom intermediate_size
         config_custom = BertConfig(hidden_size=768, intermediate_size=3072)
         self.assertEqual(config_custom.intermediate_size, 3072)
+
+    def test_invalid_ffn_activation_raises(self):
+        """Test that unsupported FFN activations are rejected."""
+        with self.assertRaises(ValueError):
+            BertConfig(ffn_activation="gelu")
 
     # ===== Gradient Checkpointing Tests =====
 
@@ -582,6 +470,23 @@ class BertFlexAttentionTest(unittest.TestCase):
         loss.backward()
 
         # Verify gradients still flow correctly with checkpointing
+        self.assertIsNotNone(model.embeddings.word_embeddings.weight.grad)
+
+    def test_gradient_checkpointing_with_document_ids(self):
+        """Ensure gradient checkpointing still works when using document masking."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.gradient_checkpointing_enable()
+        model.train()
+
+        input_ids = ids_tensor([2, 5], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids, device=torch_device)
+        document_ids = torch.tensor([[0, 0, 1, 1, 1], [0, 1, 1, 2, 2]], device=torch_device)
+
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids)
+        loss = outputs.last_hidden_state.sum()
+        loss.backward()
+
         self.assertIsNotNone(model.embeddings.word_embeddings.weight.grad)
 
     # ===== Document Masking Tests =====
@@ -642,6 +547,38 @@ class BertFlexAttentionTest(unittest.TestCase):
             outputs = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids)
 
         self.assertEqual(outputs.last_hidden_state.shape, (batch_size, seq_len, config.hidden_size))
+
+    # ===== Unsupported Inputs Tests =====
+
+    def test_head_mask_not_supported(self):
+        """Verify that passing head_mask raises an explicit error."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        head_mask = torch.ones((config.num_hidden_layers, config.num_attention_heads), device=torch_device)
+
+        input_ids = ids_tensor([1, 4], config.vocab_size).to(torch_device)
+
+        with self.assertRaises(ValueError):
+            model(input_ids=input_ids, head_mask=head_mask)
+
+    def test_use_cache_not_supported(self):
+        """Verify that use_cache triggers a clear error."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        input_ids = ids_tensor([1, 4], config.vocab_size).to(torch_device)
+
+        with self.assertRaises(ValueError):
+            model(input_ids=input_ids, use_cache=True)
+
+    def test_cross_attention_not_supported(self):
+        """Verify that encoder_hidden_states are rejected."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        input_ids = ids_tensor([1, 4], config.vocab_size).to(torch_device)
+        encoder_hidden_states = torch.randn(1, 4, config.hidden_size, device=torch_device)
+
+        with self.assertRaises(ValueError):
+            model(input_ids=input_ids, encoder_hidden_states=encoder_hidden_states)
 
     # ===== Configuration Validation Tests =====
 
@@ -772,17 +709,16 @@ class BertFlexAttentionTest(unittest.TestCase):
         self.model_tester.create_and_check_model(*config_and_inputs)
 
     def test_model_various_embeddings(self):
-        # Flex attention only supports absolute position embeddings
+        # This modernized BERT variant only supports absolute position embeddings
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         config_and_inputs[0].position_embedding_type = "absolute"
         self.model_tester.create_and_check_model(*config_and_inputs)
 
-        # Test that relative position embeddings raise an error
-        for type in ["relative_key", "relative_key_query"]:
-            config_and_inputs = self.model_tester.prepare_config_and_inputs()
-            config_and_inputs[0].position_embedding_type = type
-            with self.assertRaises(ValueError):
-                self.model_tester.create_and_check_model(*config_and_inputs)
+        # Test that relative position embeddings are rejected at config creation time
+        for pos_type in ["relative_key", "relative_key_query"]:
+            with self.assertRaises(ValueError) as cm:
+                BertConfig(position_embedding_type=pos_type)
+            self.assertIn("only supports 'absolute'", str(cm.exception))
 
     def test_model_3d_mask_shapes(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
@@ -793,94 +729,11 @@ class BertFlexAttentionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.model_tester.create_and_check_model(*config_and_inputs)
 
-    def test_model_as_decoder(self):
-        config_and_inputs = self.model_tester.prepare_config_and_inputs_for_decoder()
-        with self.assertRaises(ValueError):
-            self.model_tester.create_and_check_model_as_decoder(*config_and_inputs)
-
-    def test_model_as_decoder_with_default_input_mask(self):
-        (
-            config,
-            input_ids,
-            token_type_ids,
-            input_mask,
-            sequence_labels,
-            token_labels,
-            choice_labels,
-            encoder_hidden_states,
-            encoder_attention_mask,
-        ) = self.model_tester.prepare_config_and_inputs_for_decoder()
-
-        input_mask = None
-
-        with self.assertRaises(ValueError):
-            self.model_tester.create_and_check_model_as_decoder(
-                config,
-                input_ids,
-                token_type_ids,
-                input_mask,
-                sequence_labels,
-                token_labels,
-                choice_labels,
-                encoder_hidden_states,
-                encoder_attention_mask,
-            )
-
-    def test_model_as_decoder_with_3d_input_mask(self):
-        (
-            config,
-            input_ids,
-            token_type_ids,
-            input_mask,
-            sequence_labels,
-            token_labels,
-            choice_labels,
-            encoder_hidden_states,
-            encoder_attention_mask,
-        ) = self.model_tester.prepare_config_and_inputs_for_decoder()
-
-        batch_size, seq_length = input_mask.shape
-        input_mask = random_attention_mask([batch_size, seq_length, seq_length])
-        batch_size, seq_length = encoder_attention_mask.shape
-        encoder_attention_mask = random_attention_mask([batch_size, seq_length, seq_length])
-
-        with self.assertRaises(ValueError):
-            self.model_tester.create_and_check_model_as_decoder(
-                config,
-                input_ids,
-                token_type_ids,
-                input_mask,
-                sequence_labels,
-                token_labels,
-                choice_labels,
-                encoder_hidden_states,
-                encoder_attention_mask,
-            )
-
-    def test_for_causal_lm(self):
-        config_and_inputs = self.model_tester.prepare_config_and_inputs_for_decoder()
-        with self.assertRaises(ValueError):
-            self.model_tester.create_and_check_for_causal_lm(*config_and_inputs)
 
     def test_for_masked_lm(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
         self.model_tester.create_and_check_for_masked_lm(*config_and_inputs)
 
-    def test_for_causal_lm_decoder(self):
-        config_and_inputs = self.model_tester.prepare_config_and_inputs_for_decoder()
-        with self.assertRaises(ValueError):
-            self.model_tester.create_and_check_model_for_causal_lm_as_decoder(*config_and_inputs)
-
-    def test_decoder_model_past_with_large_inputs(self):
-        config_and_inputs = self.model_tester.prepare_config_and_inputs_for_decoder()
-        with self.assertRaises(ValueError):
-            self.model_tester.create_and_check_decoder_model_past_large_inputs(*config_and_inputs)
-
-    def test_decoder_model_past_with_large_inputs_relative_pos_emb(self):
-        config_and_inputs = self.model_tester.prepare_config_and_inputs_for_decoder()
-        config_and_inputs[0].position_embedding_type = "relative_key"
-        with self.assertRaises(ValueError):
-            self.model_tester.create_and_check_decoder_model_past_large_inputs(*config_and_inputs)
 
     def test_for_multiple_choice(self):
         config_and_inputs = self.model_tester.prepare_config_and_inputs()
@@ -954,41 +807,6 @@ class BertModelIntegrationTest(unittest.TestCase):
 
         torch.testing.assert_close(output[:, 1:4, 1:4], expected_slice, rtol=1e-4, atol=1e-4)
 
-    @slow
-    def test_inference_no_head_relative_embedding_key(self):
-        model = BertModel.from_pretrained("zhiheng-huang/bert-base-uncased-embedding-relative-key")
-        input_ids = torch.tensor([[0, 345, 232, 328, 740, 140, 1695, 69, 6078, 1588, 2]])
-        attention_mask = torch.tensor([[0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])
-        with torch.no_grad():
-            output = model(input_ids, attention_mask=attention_mask)[0]
-        expected_shape = torch.Size((1, 11, 768))
-        self.assertEqual(output.shape, expected_shape)
-        expected_slice = torch.tensor(
-            [[[0.0756, 0.3142, -0.5128], [0.3761, 0.3462, -0.5477], [0.2052, 0.3760, -0.1240]]]
-        )
-
-        torch.testing.assert_close(output[:, 1:4, 1:4], expected_slice, rtol=1e-4, atol=1e-4)
-
-    @slow
-    def test_inference_no_head_relative_embedding_key_query(self):
-        model = BertModel.from_pretrained("zhiheng-huang/bert-base-uncased-embedding-relative-key-query")
-        input_ids = torch.tensor([[0, 345, 232, 328, 740, 140, 1695, 69, 6078, 1588, 2]])
-        attention_mask = torch.tensor([[0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1]])
-        with torch.no_grad():
-            output = model(input_ids, attention_mask=attention_mask)[0]
-        expected_shape = torch.Size((1, 11, 768))
-        self.assertEqual(output.shape, expected_shape)
-        expected_slice = torch.tensor(
-            [[[0.6496, 0.3784, 0.8203], [0.8148, 0.5656, 0.2636], [-0.0681, 0.5597, 0.7045]]]
-        )
-
-        torch.testing.assert_close(output[:, 1:4, 1:4], expected_slice, rtol=1e-4, atol=1e-4)
-
-    def test_sdpa_ignored_mask(self):
-        # Flex-only variant forces the flex backend regardless of requested implementation
-        config = BertConfig()
-        model = BertModel(config)
-        self.assertEqual(model.config._attn_implementation, "flex_attention")
 
     @slow
     @pytest.mark.torch_export_test
