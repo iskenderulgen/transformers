@@ -724,6 +724,11 @@ class BertModel(BertPreTrainedModel):
         return_dict: Optional[bool] = None,
         cache_position: Optional[torch.Tensor] = None,
     ) -> Union[tuple[torch.Tensor], BaseModelOutputWithPoolingAndCrossAttentions]:
+        r"""
+        document_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Document identifiers for packed inputs when using FlexAttention. Use `0` for padding positions; tokens
+            with different document IDs will not attend to each other when building the block mask.
+        """
         if encoder_hidden_states is not None or self.config.add_cross_attention or self.config.is_decoder:
             raise ValueError("Cross-attention/decoder use is not supported in this modernized BERT variant.")
         if use_cache or past_key_values is not None:
