@@ -784,6 +784,15 @@ class BertModel(BertPreTrainedModel):
             inputs_embeds=inputs_embeds,
             past_key_values_length=past_key_values_length,
         )
+        # Bridge: Ensure embedding output matches the dtype of the norm layer (e.g., BF16)
+        # This enables fused kernels even if embeddings are stored in FP32
+        target_dtype = self.embeddings_rmsnorm.weight.dtype
+        if torch.is_autocast_enabled():
+            target_dtype = torch.get_autocast_dtype("cuda")
+
+        if embedding_output.dtype != target_dtype:
+            embedding_output = embedding_output.to(target_dtype)
+
         embedding_output = self.embeddings_rmsnorm(embedding_output)
 
         if attention_mask is None:
