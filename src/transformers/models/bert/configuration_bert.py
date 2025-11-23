@@ -69,7 +69,7 @@ class BertConfig(PretrainedConfig):
             The vocabulary size of the `token_type_ids` passed when calling [`BertModel`] or [`TFBertModel`].
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
-        layer_norm_eps (`float`, *optional*, defaults to 1e-12):
+        layer_norm_eps (`float`, *optional*, defaults to 1e-6):
             The epsilon used by the layer normalization layers.
         position_embedding_type (`str`, *optional*, defaults to `"absolute"`):
             Type of position embedding. This modernized BERT variant only supports `"absolute"` position embeddings.
@@ -113,7 +113,7 @@ class BertConfig(PretrainedConfig):
         max_position_embeddings=512,
         type_vocab_size=2,
         initializer_range=0.02,
-        layer_norm_eps=1e-12,
+        layer_norm_eps=1e-6,
         pad_token_id=0,
         ffn_activation: str = "swiglu",
         position_embedding_type="absolute",
