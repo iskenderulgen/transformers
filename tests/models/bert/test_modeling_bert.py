@@ -862,6 +862,43 @@ class BertFlexAttentionTest(unittest.TestCase):
         self.assertIsNotNone(outputs.last_hidden_state)
         self.assertEqual(outputs.last_hidden_state.dtype, torch.bfloat16)
 
+    def test_dtype_configuration_warnings(self):
+        """Test that warnings are raised for suboptimal dtype configurations."""
+        if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+            return
+
+        # Case 1: AMP ON + RMSNorm FP32 (suboptimal - should warn)
+        config = self._make_config()
+        config.rms_norm_dtype = torch.float32
+        model = BertModel(config).to(torch_device)
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+
+        with self.assertLogs(logger="transformers.models.bert.modeling_bert", level="WARNING") as cm:
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+                model(input_ids=input_ids)
+        
+        self.assertTrue(
+            any("Autocast is enabled but RMSNorm is configured to use FP32" in msg for msg in cm.output),
+            "Expected warning about suboptimal AMP+FP32 RMSNorm configuration"
+        )
+
+        # Case 2: AMP OFF + RMSNorm BF16 (broken - should warn before crash)
+        config = self._make_config()
+        config.rms_norm_dtype = torch.bfloat16
+        model = BertModel(config).to(torch_device)
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+
+        with self.assertLogs(logger="transformers.models.bert.modeling_bert", level="WARNING") as cm:
+            try:
+                model(input_ids=input_ids)
+            except RuntimeError:
+                pass  # Expected to fail, we just want to check the warning
+
+        self.assertTrue(
+            any("RMSNorm is configured to use" in msg and "but autocast is not enabled" in msg for msg in cm.output),
+            "Expected warning about dtype mismatch when AMP is OFF but RMSNorm is BF16"
+        )
+
     # ===== Serialization Tests =====
 
     def test_save_and_load_model(self):

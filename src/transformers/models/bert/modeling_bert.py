@@ -787,7 +787,24 @@ class BertModel(BertPreTrainedModel):
         # Bridge: Ensure embedding output matches the dtype of the norm layer (e.g., BF16)
         # This enables fused kernels even if embeddings are stored in FP32
         target_dtype = self.embeddings_rmsnorm.weight.dtype
-        if torch.is_autocast_enabled():
+        rms_norm_dtype = self.embeddings_rmsnorm.weight.dtype
+        autocast_enabled = torch.is_autocast_enabled()
+        
+        # Warn about suboptimal dtype configurations
+        if autocast_enabled and rms_norm_dtype == torch.float32:
+            logger.warning_once(
+                "Autocast is enabled but RMSNorm is configured to use FP32. "
+                "For optimal performance with fused kernels, set `rms_norm_dtype=torch.bfloat16` in BertConfig. "
+                "The model will work correctly but won't benefit from kernel fusion."
+            )
+        elif not autocast_enabled and rms_norm_dtype in (torch.bfloat16, torch.float16):
+            logger.warning_once(
+                f"RMSNorm is configured to use {rms_norm_dtype} but autocast is not enabled. "
+                f"This will cause dtype mismatches. Either enable autocast with `torch.autocast('cuda', dtype={rms_norm_dtype})` "
+                "or set `rms_norm_dtype=None` in BertConfig to use FP32 for all layers."
+            )
+        
+        if autocast_enabled:
             target_dtype = torch.get_autocast_dtype("cuda")
 
         if embedding_output.dtype != target_dtype:
