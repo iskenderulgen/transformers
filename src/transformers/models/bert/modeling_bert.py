@@ -336,13 +336,14 @@ class BertLayer(GradientCheckpointingLayer):
         self.attention = BertAttention(config, layer_idx=layer_idx)
         self.is_decoder = config.is_decoder
         self.add_cross_attention = config.add_cross_attention
-        self.attention_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=config.rms_norm_dtype)
-        self.output_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=config.rms_norm_dtype)
+        rms_norm_dtype = torch.bfloat16 if hasattr(config, "rms_norm_dtype") and config.rms_norm_dtype == "bfloat16" else None
+        self.attention_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=rms_norm_dtype)
+        self.output_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=rms_norm_dtype)
         if self.add_cross_attention:
             if not self.is_decoder:
                 raise ValueError(f"{self} should be used as a decoder model if cross attention is added")
             self.crossattention = BertAttention(config, position_embedding_type="absolute", layer_idx=layer_idx)
-            self.crossattention_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=config.rms_norm_dtype)
+            self.crossattention_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=rms_norm_dtype)
         else:
             self.crossattention_rmsnorm = None
         self.intermediate = BertIntermediate(config)
@@ -525,7 +526,8 @@ class BertPredictionHeadTransform(nn.Module):
             self.transform_act_fn = ACT2FN[config.hidden_act]
         else:
             self.transform_act_fn = config.hidden_act
-        self.rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=config.rms_norm_dtype)
+        rms_norm_dtype = torch.bfloat16 if hasattr(config, "rms_norm_dtype") and config.rms_norm_dtype == "bfloat16" else None
+        self.rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=rms_norm_dtype)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
@@ -679,9 +681,10 @@ class BertModel(BertPreTrainedModel):
             )
 
         self.embeddings = BertEmbeddings(config)
-        self.embeddings_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=config.rms_norm_dtype)
+        rms_norm_dtype = torch.bfloat16 if hasattr(config, "rms_norm_dtype") and config.rms_norm_dtype == "bfloat16" else None
+        self.embeddings_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=rms_norm_dtype)
         self.encoder = BertEncoder(config)
-        self.final_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=config.rms_norm_dtype)
+        self.final_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=rms_norm_dtype)
 
         self.pooler = BertPooler(config) if add_pooling_layer else None
 
@@ -794,7 +797,7 @@ class BertModel(BertPreTrainedModel):
         if autocast_enabled and rms_norm_dtype == torch.float32:
             logger.warning_once(
                 "Autocast is enabled but RMSNorm is configured to use FP32. "
-                "For optimal performance with fused kernels, set `rms_norm_dtype=torch.bfloat16` in BertConfig. "
+                "For optimal performance with fused kernels, set `rms_norm_dtype='bfloat16'` in BertConfig. "
                 "The model will work correctly but won't benefit from kernel fusion."
             )
         elif not autocast_enabled and rms_norm_dtype in (torch.bfloat16, torch.float16):

@@ -82,8 +82,8 @@ class BertConfig(PretrainedConfig):
             relevant if `config.is_decoder=True`.
         classifier_dropout (`float`, *optional*):
             The dropout ratio for the classification head.
-        rms_norm_dtype (`str` or `torch.dtype`, *optional*):
-            The dtype of the RMSNorm layers. If not set, defaults to `torch_dtype`.
+        rms_norm_dtype (`str`, *optional*):
+            The dtype of the RMSNorm layers. If set to "bfloat16", the RMSNorm layers will be initialized with `torch.bfloat16`.
 
     Examples:
 
