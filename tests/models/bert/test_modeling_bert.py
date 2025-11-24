@@ -822,7 +822,7 @@ class BertFlexAttentionTest(unittest.TestCase):
         # Case 1: Happy Path (AMP ON, RMSNorm BF16)
         # Expected: Pass, output is BF16, embeddings stay FP32, fused kernels enabled
         config = self._make_config()
-        config.rms_norm_dtype = torch.bfloat16
+        config.rms_norm_dtype = "bfloat16"
         model = BertModel(config).to(torch_device)
         input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
         
@@ -840,7 +840,7 @@ class BertFlexAttentionTest(unittest.TestCase):
         # Case 2: Instability A (AMP OFF, RMSNorm BF16)
         # Expected: Fail. RMSNorm outputs BF16, next Linear (FP32) crashes.
         config = self._make_config()
-        config.rms_norm_dtype = torch.bfloat16
+        config.rms_norm_dtype = "bfloat16"
         model = BertModel(config).to(torch_device) # Linear layers are FP32
         input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
 
@@ -884,7 +884,7 @@ class BertFlexAttentionTest(unittest.TestCase):
 
         # Case 2: AMP OFF + RMSNorm BF16 (broken - should warn before crash)
         config = self._make_config()
-        config.rms_norm_dtype = torch.bfloat16
+        config.rms_norm_dtype = "bfloat16"
         model = BertModel(config).to(torch_device)
         input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
 
