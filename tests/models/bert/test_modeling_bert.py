@@ -1066,7 +1066,7 @@ class BertFlexAttentionTest(unittest.TestCase):
 
         # Check for warnings if the attention_mask is missing.
         logger = logging.get_logger("transformers.modeling_utils")
-        # clear cache so we can test the warning is emitted (from `warning_once`).
+        # clear cache so we can test the warning is emitted.
         logger.warning_once.cache_clear()
 
         with CaptureLogger(logger) as cl:
@@ -1159,3 +1159,32 @@ class BertModelIntegrationTest(unittest.TestCase):
         
         # Outputs should differ because attention patterns are different
         self.assertFalse(torch.allclose(packed_out, single_out))
+
+    def test_position_ids_reset_with_document_ids(self):
+        """Test that position_ids are reset based on document_ids."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+
+        input_ids = torch.tensor([[1, 2, 3, 4, 5]], device=torch_device)
+        # Document IDs: [0, 0, 1, 1, 1] -> Doc 0 has length 2, Doc 1 has length 3
+        document_ids = torch.tensor([[0, 0, 1, 1, 1]], device=torch_device)
+
+        # Expected position IDs: [0, 1, 0, 1, 2]
+        expected_pos_ids = torch.tensor([[0, 1, 0, 1, 2]], device=torch_device)
+
+        captured_kwargs = {}
+        def hook(module, args, kwargs, output):
+            captured_kwargs.update(kwargs)
+
+        # Register hook to capture arguments passed to embeddings
+        if version.parse(torch.__version__) >= version.parse("2.0"):
+             handle = model.embeddings.register_forward_hook(hook, with_kwargs=True)
+        else:
+             # Fallback for older torch if needed, but FlexAttention requires new torch anyway
+             handle = model.embeddings.register_forward_hook(hook, with_kwargs=True)
+
+        model(input_ids=input_ids, document_ids=document_ids)
+        handle.remove()
+
+        self.assertIn("position_ids", captured_kwargs)
+        self.assertTrue(torch.equal(captured_kwargs["position_ids"], expected_pos_ids))

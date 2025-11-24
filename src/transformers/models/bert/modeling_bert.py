@@ -781,6 +781,25 @@ class BertModel(BertPreTrainedModel):
             else:
                 token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=device)
 
+        # Automatic Position ID Generation for Packed Sequences
+        if position_ids is None:
+            if document_ids is not None:
+                doc_ids_for_pos = document_ids
+            elif attention_mask is not None and (attention_mask > 1).any():
+                doc_ids_for_pos = attention_mask
+            else:
+                doc_ids_for_pos = None
+
+            if doc_ids_for_pos is not None:
+                doc_ids_for_pos = doc_ids_for_pos.to(device).long()
+                doc_ids_shifted = doc_ids_for_pos.roll(1, 1)
+                doc_ids_shifted[:, 0] = -1
+                is_boundary = (doc_ids_for_pos != doc_ids_shifted)
+                indices = torch.arange(seq_length, device=device).unsqueeze(0)
+                boundary_indices = (indices * is_boundary.long())
+                doc_starts = boundary_indices.cummax(dim=1).values
+                position_ids = (indices - doc_starts).long()
+
         embedding_output = self.embeddings(
             input_ids=input_ids,
             position_ids=position_ids,
