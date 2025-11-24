@@ -809,6 +809,59 @@ class BertFlexAttentionTest(unittest.TestCase):
         loss.backward()
         self.assertIsNotNone(model.embeddings.word_embeddings.weight.grad)
 
+    def test_mixed_precision_rms_norm_configurations(self):
+        """
+        Tests various combinations of AMP and RMSNorm dtype to ensure:
+        1. Happy Path: AMP=ON (BF16) + RMSNorm=BF16 -> Works (End-to-end BF16, fused kernels)
+        2. Instability A: AMP=OFF + RMSNorm=BF16 -> Fails (Linear layer dtype mismatch)
+        3. Suboptimal: AMP=ON (BF16) + RMSNorm=FP32 -> Works but loses fused kernel benefit
+        """
+        if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
+            return
+
+        # Case 1: Happy Path (AMP ON, RMSNorm BF16)
+        # Expected: Pass, output is BF16, embeddings stay FP32, fused kernels enabled
+        config = self._make_config()
+        config.rms_norm_dtype = torch.bfloat16
+        model = BertModel(config).to(torch_device)
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+        
+        # Verify embeddings are still FP32 for stability
+        self.assertEqual(model.embeddings.word_embeddings.weight.dtype, torch.float32)
+        # Verify RMSNorm is BF16
+        self.assertEqual(model.embeddings_rmsnorm.weight.dtype, torch.bfloat16)
+        
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs = model(input_ids=input_ids)
+        
+        self.assertIsNotNone(outputs.last_hidden_state)
+        self.assertEqual(outputs.last_hidden_state.dtype, torch.bfloat16)
+
+        # Case 2: Instability A (AMP OFF, RMSNorm BF16)
+        # Expected: Fail. RMSNorm outputs BF16, next Linear (FP32) crashes.
+        config = self._make_config()
+        config.rms_norm_dtype = torch.bfloat16
+        model = BertModel(config).to(torch_device) # Linear layers are FP32
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+
+        with self.assertRaises(RuntimeError):
+            model(input_ids=input_ids)
+
+        # Case 3: Suboptimal (AMP ON, RMSNorm FP32)
+        # Expected: Works, but autocast handles dtype conversions (loses fused kernel benefit)
+        # This is valid but not optimal for performance.
+        config = self._make_config()
+        config.rms_norm_dtype = torch.float32
+        model = BertModel(config).to(torch_device)
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+            outputs = model(input_ids=input_ids)
+        
+        # Output will be BF16 because of autocast, but RMSNorm doesn't benefit from fused kernels
+        self.assertIsNotNone(outputs.last_hidden_state)
+        self.assertEqual(outputs.last_hidden_state.dtype, torch.bfloat16)
+
     # ===== Serialization Tests =====
 
     def test_save_and_load_model(self):
