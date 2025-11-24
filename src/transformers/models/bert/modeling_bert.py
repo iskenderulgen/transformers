@@ -1041,6 +1041,7 @@ class BertLMHeadModel(BertPreTrainedModel, GenerationMixin):
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        document_ids: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
@@ -1069,6 +1070,7 @@ class BertLMHeadModel(BertPreTrainedModel, GenerationMixin):
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
+            document_ids=document_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             encoder_hidden_states=encoder_hidden_states,
@@ -1135,6 +1137,7 @@ class BertForMaskedLM(BertPreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        document_ids: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         encoder_hidden_states: Optional[torch.Tensor] = None,
@@ -1150,7 +1153,14 @@ class BertForMaskedLM(BertPreTrainedModel):
             Labels for computing the masked language modeling loss. Indices should be in `[-100, 0, ...,
             config.vocab_size]` (see `input_ids` docstring) Tokens with indices set to `-100` are ignored (masked), the
             loss is only computed for the tokens with labels in `[0, ..., config.vocab_size]`
+        document_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Document identifiers for packed inputs. Use `0` for padding positions; tokens with different document IDs
+            will not attend to each other when building the flex attention block mask.
         """
+
+        # Support legacy callers that might pass document_ids via **kwargs
+        if document_ids is None:
+            document_ids = kwargs.pop("document_ids", None)
 
         return_dict = return_dict if return_dict is not None else self.config.use_return_dict
 
@@ -1159,6 +1169,7 @@ class BertForMaskedLM(BertPreTrainedModel):
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
+            document_ids=document_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             encoder_hidden_states=encoder_hidden_states,
