@@ -1168,6 +1168,8 @@ class BertModelIntegrationTest(unittest.TestCase):
         input_ids = torch.tensor([[1, 2, 3, 4, 5]], device=torch_device)
         # Document IDs: [0, 0, 1, 1, 1] -> Doc 0 has length 2, Doc 1 has length 3
         document_ids = torch.tensor([[0, 0, 1, 1, 1]], device=torch_device)
+        # Attention mask is all ones for this test case
+        attention_mask = torch.ones_like(input_ids)
 
         # Expected position IDs: [0, 1, 0, 1, 2]
         expected_pos_ids = torch.tensor([[0, 1, 0, 1, 2]], device=torch_device)
@@ -1183,7 +1185,7 @@ class BertModelIntegrationTest(unittest.TestCase):
              # Fallback for older torch if needed, but FlexAttention requires new torch anyway
              handle = model.embeddings.register_forward_hook(hook, with_kwargs=True)
 
-        model(input_ids=input_ids, document_ids=document_ids)
+        model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids)
         handle.remove()
 
         self.assertIn("position_ids", captured_kwargs)

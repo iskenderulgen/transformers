@@ -799,6 +799,11 @@ class BertModel(BertPreTrainedModel):
                 boundary_indices = (indices * is_boundary.long())
                 doc_starts = boundary_indices.cummax(dim=1).values
                 position_ids = (indices - doc_starts).long()
+                
+                # Mask position_ids for padding
+                # Use attention_mask if available to identify padding
+                if attention_mask is not None:
+                    position_ids = position_ids * attention_mask.to(dtype=torch.long)
 
         embedding_output = self.embeddings(
             input_ids=input_ids,
@@ -852,8 +857,9 @@ class BertModel(BertPreTrainedModel):
             
             # Shift document IDs by 1 so that user's [0, 0, 1, 1] becomes [1, 1, 2, 2]
             # This ensures doc_id > 0 for all valid documents
-            # Apply attention_mask to set padding positions to 0
-            doc_mask_source = (doc_mask_source + 1) * attention_mask.to(dtype=torch.long)
+            doc_mask_source = (doc_mask_source + 1)
+            # Apply attention_mask to set padding positions to 0 (padding should have mask 0)
+            doc_mask_source = doc_mask_source * attention_mask.to(dtype=torch.long)
         else:
             # No document_ids: all valid tokens are document 1, padding is 0
             doc_mask_source = attention_mask.to(dtype=torch.long)
