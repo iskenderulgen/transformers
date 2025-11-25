@@ -48,6 +48,7 @@ if is_torch_available():
         BertModel,
         logging,
     )
+    from transformers.models.bert.modeling_bert import BertRMSNorm
 
 
 class BertModelTester:
@@ -332,11 +333,11 @@ class BertFlexAttentionTest(unittest.TestCase):
 
         # Check that RMSNorm layers exist
         for layer in model.encoder.layer:
-            self.assertIsInstance(layer.attention_rmsnorm, torch.nn.RMSNorm)
-            self.assertIsInstance(layer.output_rmsnorm, torch.nn.RMSNorm)
+            self.assertIsInstance(layer.attention_rmsnorm, BertRMSNorm)
+            self.assertIsInstance(layer.output_rmsnorm, BertRMSNorm)
 
         # Check embeddings RMSNorm exists
-        self.assertIsInstance(model.embeddings_rmsnorm, torch.nn.RMSNorm)
+        self.assertIsInstance(model.embeddings_rmsnorm, BertRMSNorm)
 
     def test_rmsnorm_eps_value(self):
         """Test that RMSNorm uses correct epsilon from config."""
@@ -345,9 +346,9 @@ class BertFlexAttentionTest(unittest.TestCase):
         model = BertModel(config).to(torch_device)
 
         # Check epsilon matches config
-        self.assertEqual(model.embeddings_rmsnorm.eps, config.layer_norm_eps)
-        self.assertEqual(model.encoder.layer[0].attention_rmsnorm.eps, config.layer_norm_eps)
-        self.assertEqual(model.encoder.layer[0].output_rmsnorm.eps, config.layer_norm_eps)
+        self.assertEqual(model.embeddings_rmsnorm.variance_epsilon, config.layer_norm_eps)
+        self.assertEqual(model.encoder.layer[0].attention_rmsnorm.variance_epsilon, config.layer_norm_eps)
+        self.assertEqual(model.encoder.layer[0].output_rmsnorm.variance_epsilon, config.layer_norm_eps)
 
     # ===== SwiGLU Tests =====
 
@@ -809,95 +810,39 @@ class BertFlexAttentionTest(unittest.TestCase):
         loss.backward()
         self.assertIsNotNone(model.embeddings.word_embeddings.weight.grad)
 
-    def test_mixed_precision_rms_norm_configurations(self):
+    def test_mixed_precision_rms_norm(self):
         """
-        Tests various combinations of AMP and RMSNorm dtype to ensure:
-        1. Happy Path: AMP=ON (BF16) + RMSNorm=BF16 -> Works (End-to-end BF16, fused kernels)
-        2. Instability A: AMP=OFF + RMSNorm=BF16 -> Fails (Linear layer dtype mismatch)
-        3. Suboptimal: AMP=ON (BF16) + RMSNorm=FP32 -> Works but loses fused kernel benefit
+        Test that BertRMSNorm handles mixed precision correctly by casting
+        to float32 internally for numerical stability and returning to input dtype.
         """
         if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
             return
 
-        # Case 1: Happy Path (AMP ON, RMSNorm BF16)
-        # Expected: Pass, output is BF16, embeddings stay FP32, fused kernels enabled
         config = self._make_config()
-        config.rms_norm_dtype = "bfloat16"
         model = BertModel(config).to(torch_device)
         input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
         
-        # Verify embeddings are still FP32 for stability
-        self.assertEqual(model.embeddings.word_embeddings.weight.dtype, torch.float32)
-        # Verify RMSNorm is BF16
-        self.assertEqual(model.embeddings_rmsnorm.weight.dtype, torch.bfloat16)
-        
+        # Test with autocast - model should work without errors
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             outputs = model(input_ids=input_ids)
         
         self.assertIsNotNone(outputs.last_hidden_state)
-        self.assertEqual(outputs.last_hidden_state.dtype, torch.bfloat16)
+        # Output should not have NaN or Inf values (numerical stability check)
+        self.assertFalse(torch.isnan(outputs.last_hidden_state).any())
+        self.assertFalse(torch.isinf(outputs.last_hidden_state).any())
 
-        # Case 2: Instability A (AMP OFF, RMSNorm BF16)
-        # Expected: Fail. RMSNorm outputs BF16, next Linear (FP32) crashes.
-        config = self._make_config()
-        config.rms_norm_dtype = "bfloat16"
-        model = BertModel(config).to(torch_device) # Linear layers are FP32
-        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
-
-        with self.assertRaises(RuntimeError):
-            model(input_ids=input_ids)
-
-        # Case 3: Suboptimal (AMP ON, RMSNorm FP32)
-        # Expected: Works, but autocast handles dtype conversions (loses fused kernel benefit)
-        # This is valid but not optimal for performance.
-        config = self._make_config()
-        config.rms_norm_dtype = torch.float32
-        model = BertModel(config).to(torch_device)
-        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
-
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            outputs = model(input_ids=input_ids)
+        # Test without autocast - model should work with FP32
+        model_fp32 = BertModel(config).to(torch_device)
+        outputs_fp32 = model_fp32(input_ids=input_ids)
+        self.assertIsNotNone(outputs_fp32.last_hidden_state)
+        self.assertEqual(outputs_fp32.last_hidden_state.dtype, torch.float32)
         
-        # Output will be BF16 because of autocast, but RMSNorm doesn't benefit from fused kernels
-        self.assertIsNotNone(outputs.last_hidden_state)
-        self.assertEqual(outputs.last_hidden_state.dtype, torch.bfloat16)
-
-    def test_dtype_configuration_warnings(self):
-        """Test that warnings are raised for suboptimal dtype configurations."""
-        if not torch.cuda.is_available() or not torch.cuda.is_bf16_supported():
-            return
-
-        # Case 1: AMP ON + RMSNorm FP32 (suboptimal - should warn)
-        config = self._make_config()
-        config.rms_norm_dtype = torch.float32
-        model = BertModel(config).to(torch_device)
-        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
-
-        with self.assertLogs(logger="transformers.models.bert.modeling_bert", level="WARNING") as cm:
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-                model(input_ids=input_ids)
-        
-        self.assertTrue(
-            any("Autocast is enabled but RMSNorm is configured to use FP32" in msg for msg in cm.output),
-            "Expected warning about suboptimal AMP+FP32 RMSNorm configuration"
-        )
-
-        # Case 2: AMP OFF + RMSNorm BF16 (broken - should warn before crash)
-        config = self._make_config()
-        config.rms_norm_dtype = "bfloat16"
-        model = BertModel(config).to(torch_device)
-        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
-
-        with self.assertLogs(logger="transformers.models.bert.modeling_bert", level="WARNING") as cm:
-            try:
-                model(input_ids=input_ids)
-            except RuntimeError:
-                pass  # Expected to fail, we just want to check the warning
-
-        self.assertTrue(
-            any("RMSNorm is configured to use" in msg and "but autocast is not enabled" in msg for msg in cm.output),
-            "Expected warning about dtype mismatch when AMP is OFF but RMSNorm is BF16"
-        )
+        # Test with model in bfloat16 - RMSNorm should still be numerically stable
+        model_bf16 = BertModel(config).to(torch_device).to(torch.bfloat16)
+        outputs_bf16 = model_bf16(input_ids=input_ids)
+        self.assertEqual(outputs_bf16.last_hidden_state.dtype, torch.bfloat16)
+        self.assertFalse(torch.isnan(outputs_bf16.last_hidden_state).any())
+        self.assertFalse(torch.isinf(outputs_bf16.last_hidden_state).any())
 
     # ===== Serialization Tests =====
 

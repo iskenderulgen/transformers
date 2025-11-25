@@ -82,8 +82,6 @@ class BertConfig(PretrainedConfig):
             relevant if `config.is_decoder=True`.
         classifier_dropout (`float`, *optional*):
             The dropout ratio for the classification head.
-        rms_norm_dtype (`str`, *optional*):
-            The dtype of the RMSNorm layers. If set to "bfloat16", the RMSNorm layers will be initialized with `torch.bfloat16`.
 
     Examples:
 
@@ -121,7 +119,6 @@ class BertConfig(PretrainedConfig):
         position_embedding_type="absolute",
         use_cache=True,
         classifier_dropout=None,
-        rms_norm_dtype=None,
         **kwargs,
     ):
         super().__init__(pad_token_id=pad_token_id, **kwargs)
@@ -166,7 +163,6 @@ class BertConfig(PretrainedConfig):
         self.position_embedding_type = position_embedding_type
         self.use_cache = use_cache
         self.classifier_dropout = classifier_dropout
-        self.rms_norm_dtype = rms_norm_dtype
         self._attn_implementation = "flex_attention"
 
 

@@ -54,11 +54,34 @@ from ...modeling_outputs import (
 from ...modeling_utils import PreTrainedModel
 from ...pytorch_utils import apply_chunking_to_forward, find_pruneable_heads_and_indices, prune_linear_layer
 from ...utils import ModelOutput, auto_docstring, logging
+from ...integrations import use_kernel_forward_from_hub
 from ...utils.deprecation import deprecate_kwarg
 from .configuration_bert import BertConfig
 
 
 logger = logging.get_logger(__name__)
+
+
+@use_kernel_forward_from_hub("RMSNorm")
+class BertRMSNorm(nn.Module):
+    def __init__(self, hidden_size, eps=1e-6):
+        """
+        BertRMSNorm is equivalent to LlamaRMSNorm/T5LayerNorm.
+        Handles dtype casting internally to avoid numerical issues.
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.variance_epsilon = eps
+
+    def forward(self, hidden_states):
+        input_dtype = hidden_states.dtype
+        hidden_states = hidden_states.to(torch.float32)
+        variance = hidden_states.pow(2).mean(-1, keepdim=True)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.variance_epsilon)
+        return self.weight * hidden_states.to(input_dtype)
+
+    def extra_repr(self):
+        return f"{tuple(self.weight.shape)}, eps={self.variance_epsilon}"
 
 
 class BertEmbeddings(nn.Module):
@@ -336,14 +359,13 @@ class BertLayer(GradientCheckpointingLayer):
         self.attention = BertAttention(config, layer_idx=layer_idx)
         self.is_decoder = config.is_decoder
         self.add_cross_attention = config.add_cross_attention
-        rms_norm_dtype = torch.bfloat16 if hasattr(config, "rms_norm_dtype") and config.rms_norm_dtype == "bfloat16" else None
-        self.attention_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=rms_norm_dtype)
-        self.output_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=rms_norm_dtype)
+        self.attention_rmsnorm = BertRMSNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.output_rmsnorm = BertRMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         if self.add_cross_attention:
             if not self.is_decoder:
                 raise ValueError(f"{self} should be used as a decoder model if cross attention is added")
             self.crossattention = BertAttention(config, position_embedding_type="absolute", layer_idx=layer_idx)
-            self.crossattention_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=rms_norm_dtype)
+            self.crossattention_rmsnorm = BertRMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         else:
             self.crossattention_rmsnorm = None
         self.intermediate = BertIntermediate(config)
@@ -526,8 +548,7 @@ class BertPredictionHeadTransform(nn.Module):
             self.transform_act_fn = ACT2FN[config.hidden_act]
         else:
             self.transform_act_fn = config.hidden_act
-        rms_norm_dtype = torch.bfloat16 if hasattr(config, "rms_norm_dtype") and config.rms_norm_dtype == "bfloat16" else None
-        self.rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=rms_norm_dtype)
+        self.rmsnorm = BertRMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         hidden_states = self.dense(hidden_states)
@@ -619,7 +640,7 @@ class BertPreTrainedModel(PreTrainedModel):
             module.weight.data.normal_(mean=0.0, std=self.config.initializer_range)
             if module.padding_idx is not None:
                 module.weight.data[module.padding_idx].zero_()
-        elif isinstance(module, nn.RMSNorm):
+        elif isinstance(module, BertRMSNorm):
             module.weight.data.fill_(1.0)
         elif isinstance(module, BertLMPredictionHead):
             module.bias.data.zero_()
@@ -681,10 +702,9 @@ class BertModel(BertPreTrainedModel):
             )
 
         self.embeddings = BertEmbeddings(config)
-        rms_norm_dtype = torch.bfloat16 if hasattr(config, "rms_norm_dtype") and config.rms_norm_dtype == "bfloat16" else None
-        self.embeddings_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=rms_norm_dtype)
+        self.embeddings_rmsnorm = BertRMSNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.encoder = BertEncoder(config)
-        self.final_rmsnorm = nn.RMSNorm(config.hidden_size, eps=config.layer_norm_eps, dtype=rms_norm_dtype)
+        self.final_rmsnorm = BertRMSNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         self.pooler = BertPooler(config) if add_pooling_layer else None
 
@@ -812,32 +832,6 @@ class BertModel(BertPreTrainedModel):
             inputs_embeds=inputs_embeds,
             past_key_values_length=past_key_values_length,
         )
-        # Bridge: Ensure embedding output matches the dtype of the norm layer (e.g., BF16)
-        # This enables fused kernels even if embeddings are stored in FP32
-        target_dtype = self.embeddings_rmsnorm.weight.dtype
-        rms_norm_dtype = self.embeddings_rmsnorm.weight.dtype
-        autocast_enabled = torch.is_autocast_enabled()
-        
-        # Warn about suboptimal dtype configurations
-        if autocast_enabled and rms_norm_dtype == torch.float32:
-            logger.warning_once(
-                "Autocast is enabled but RMSNorm is configured to use FP32. "
-                "For optimal performance with fused kernels, set `rms_norm_dtype='bfloat16'` in BertConfig. "
-                "The model will work correctly but won't benefit from kernel fusion."
-            )
-        elif not autocast_enabled and rms_norm_dtype in (torch.bfloat16, torch.float16):
-            logger.warning_once(
-                f"RMSNorm is configured to use {rms_norm_dtype} but autocast is not enabled. "
-                f"This will cause dtype mismatches. Either enable autocast with `torch.autocast('cuda', dtype={rms_norm_dtype})` "
-                "or set `rms_norm_dtype=None` in BertConfig to use FP32 for all layers."
-            )
-        
-        if autocast_enabled:
-            target_dtype = torch.get_autocast_dtype("cuda")
-
-        if embedding_output.dtype != target_dtype:
-            embedding_output = embedding_output.to(target_dtype)
-
         embedding_output = self.embeddings_rmsnorm(embedding_output)
 
         if attention_mask is None:
