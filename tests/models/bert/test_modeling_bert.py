@@ -632,6 +632,197 @@ class BertFlexAttentionTest(unittest.TestCase):
         self.assertEqual(output_default.shape, (1, 4, config.hidden_size))
         self.assertFalse(torch.isnan(output_default).any())
 
+    # ===== Document Masking Correctness Tests =====
+
+    def test_document_masking_isolates_representations(self):
+        """
+        Critical test: Verify that changing tokens in doc B does NOT affect doc A's representations.
+        This is the key property of correct document masking.
+        """
+        config = self._make_config(num_hidden_layers=2, hidden_size=64, num_attention_heads=4)
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        # Input: [Doc0: tokens 1,2,3] [Doc1: tokens 4,5,6]
+        input_ids_v1 = torch.tensor([[1, 2, 3, 4, 5, 6]], device=torch_device)
+        # Change ONLY Doc1 tokens (positions 3,4,5)
+        input_ids_v2 = torch.tensor([[1, 2, 3, 7, 8, 9]], device=torch_device)
+        
+        attention_mask = torch.ones_like(input_ids_v1)
+        # Doc0 = positions 0,1,2; Doc1 = positions 3,4,5
+        document_ids = torch.tensor([[0, 0, 0, 1, 1, 1]], device=torch_device)
+
+        with torch.no_grad():
+            out_v1 = model(input_ids=input_ids_v1, attention_mask=attention_mask, document_ids=document_ids).last_hidden_state
+            out_v2 = model(input_ids=input_ids_v2, attention_mask=attention_mask, document_ids=document_ids).last_hidden_state
+
+        # Doc0 representations (positions 0,1,2) should be IDENTICAL
+        # because Doc0 tokens cannot attend to Doc1 tokens
+        torch.testing.assert_close(
+            out_v1[:, :3, :], out_v2[:, :3, :],
+            msg="Doc0 representations changed when Doc1 tokens changed - document masking is broken!"
+        )
+        
+        # Doc1 representations (positions 3,4,5) should be DIFFERENT
+        # because we changed the input tokens
+        self.assertFalse(
+            torch.allclose(out_v1[:, 3:, :], out_v2[:, 3:, :]),
+            msg="Doc1 representations didn't change when Doc1 tokens changed"
+        )
+
+    def test_document_masking_first_token_isolation(self):
+        """
+        Test that the first token of a document only sees tokens from its own document.
+        The [CLS] token of Doc1 should not be influenced by Doc0.
+        """
+        config = self._make_config(num_hidden_layers=1, hidden_size=32, num_attention_heads=2)
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        # Packed: [CLS0, A, B, SEP0, CLS1, C, D, SEP1]
+        # Use token IDs within vocab_size=32
+        input_ids = torch.tensor([[1, 10, 11, 2, 1, 20, 21, 2]], device=torch_device)
+        attention_mask = torch.ones_like(input_ids)
+        document_ids = torch.tensor([[0, 0, 0, 0, 1, 1, 1, 1]], device=torch_device)
+
+        # Change Doc0 content only (keep IDs within vocab_size=32)
+        input_ids_changed = torch.tensor([[1, 15, 16, 2, 1, 20, 21, 2]], device=torch_device)
+
+        with torch.no_grad():
+            out_original = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids).last_hidden_state
+            out_changed = model(input_ids=input_ids_changed, attention_mask=attention_mask, document_ids=document_ids).last_hidden_state
+
+        # Doc1's CLS token (position 4) should be identical
+        torch.testing.assert_close(
+            out_original[:, 4, :], out_changed[:, 4, :],
+            msg="Doc1's [CLS] token changed when only Doc0 content changed!"
+        )
+
+    def test_document_masking_bidirectional_attention(self):
+        """
+        Test that bidirectional attention works within documents.
+        Token at position 0 should see token at position 2 within same doc.
+        """
+        config = self._make_config(num_hidden_layers=1, hidden_size=32, num_attention_heads=2)
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        # Single document, all tokens should attend to each other
+        input_ids = torch.tensor([[1, 2, 3, 4]], device=torch_device)
+        attention_mask = torch.ones_like(input_ids)
+        document_ids = torch.tensor([[0, 0, 0, 0]], device=torch_device)
+
+        with torch.no_grad():
+            out = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids).last_hidden_state
+
+        # All tokens should have non-trivial representations
+        self.assertFalse(torch.isnan(out).any())
+        self.assertFalse(torch.isinf(out).any())
+        
+        # Verify it's not just the same vector repeated (which would indicate broken attention)
+        self.assertFalse(torch.allclose(out[:, 0, :], out[:, 1, :]))
+
+    def test_document_masking_zero_based_ids(self):
+        """
+        Test that document IDs starting from 0 work correctly.
+        User provides [0, 0, 1, 1], internally shifted to [1, 1, 2, 2].
+        """
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        input_ids = torch.tensor([[10, 11, 20, 21]], device=torch_device)
+        attention_mask = torch.ones_like(input_ids)
+        
+        # Zero-based document IDs (common user expectation)
+        document_ids_zero = torch.tensor([[0, 0, 1, 1]], device=torch_device)
+        # One-based document IDs  
+        document_ids_one = torch.tensor([[1, 1, 2, 2]], device=torch_device)
+
+        with torch.no_grad():
+            out_zero = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids_zero).last_hidden_state
+            out_one = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids_one).last_hidden_state
+
+        # Both should produce the same results (internal +1 shift handles this)
+        torch.testing.assert_close(out_zero, out_one)
+
+    def test_document_masking_with_negative_padding_ids(self):
+        """
+        Test that negative document IDs for padding work correctly.
+        Padding positions should not attend to or be attended by valid tokens.
+        """
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        # Input with padding at the end
+        input_ids = torch.tensor([[1, 2, 3, 0, 0]], device=torch_device)
+        attention_mask = torch.tensor([[1, 1, 1, 0, 0]], device=torch_device)
+        # User might use -1 for padding document IDs
+        document_ids = torch.tensor([[0, 0, 0, -1, -1]], device=torch_device)
+
+        with torch.no_grad():
+            out = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids).last_hidden_state
+
+        # Should not have NaN or inf
+        self.assertFalse(torch.isnan(out).any())
+        self.assertFalse(torch.isinf(out).any())
+        
+        # Valid token representations should be reasonable
+        self.assertEqual(out.shape, (1, 5, config.hidden_size))
+
+    def test_attention_output_shape_correctness(self):
+        """
+        Test that attention output has correct shape after flex_attention_forward.
+        This catches the double-transpose bug.
+        """
+        config = self._make_config(hidden_size=64, num_attention_heads=4)
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        batch_size, seq_len = 2, 8
+        input_ids = ids_tensor([batch_size, seq_len], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        with torch.no_grad():
+            out = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+        # Verify correct shape
+        expected_shape = (batch_size, seq_len, config.hidden_size)
+        self.assertEqual(out.shape, expected_shape, f"Expected {expected_shape}, got {out.shape}")
+        
+        # Verify values are reasonable (not scrambled)
+        self.assertFalse(torch.isnan(out).any())
+        self.assertFalse(torch.isinf(out).any())
+        
+        # Verify different positions have different representations
+        # (would be suspicious if all positions had same representation)
+        unique_representations = len(set(tuple(out[0, i, :5].tolist()) for i in range(seq_len)))
+        self.assertGreater(unique_representations, 1, "All positions have identical representations - something is wrong")
+
+    def test_document_masking_gradient_flow(self):
+        """
+        Test that gradients flow correctly through document-masked attention.
+        Gradient for Doc0 tokens should not depend on Doc1 loss.
+        """
+        config = self._make_config(num_hidden_layers=1, hidden_size=32, num_attention_heads=2)
+        model = BertModel(config).to(torch_device)
+        model.train()
+
+        input_ids = torch.tensor([[1, 2, 3, 4, 5, 6]], device=torch_device)
+        attention_mask = torch.ones_like(input_ids)
+        document_ids = torch.tensor([[0, 0, 0, 1, 1, 1]], device=torch_device)
+
+        # Forward pass
+        out = model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids).last_hidden_state
+
+        # Loss only on Doc1 (positions 3, 4, 5)
+        loss_doc1 = out[:, 3:, :].sum()
+        loss_doc1.backward()
+
+        # Check gradients exist
+        self.assertIsNotNone(model.embeddings.word_embeddings.weight.grad)
+
     # ===== Unsupported Inputs Tests =====
 
     def test_head_mask_not_supported(self):

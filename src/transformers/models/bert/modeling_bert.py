@@ -232,7 +232,7 @@ class BertFlexSelfAttention(nn.Module):
             dropout=self.dropout_prob,
         )
 
-        attn_output = attn_output.transpose(1, 2).reshape(bsz, tgt_len, self.all_head_size)
+        attn_output = attn_output.reshape(bsz, tgt_len, self.all_head_size)
 
         return attn_output, None
 
