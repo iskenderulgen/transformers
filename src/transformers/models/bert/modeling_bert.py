@@ -132,6 +132,11 @@ class BertEmbeddings(nn.Module):
             else:
                 token_type_ids = torch.zeros(input_shape, dtype=torch.long, device=self.position_ids.device)
 
+        # If type_vocab_size is 1, we ignore the input token_type_ids (which might come from a tokenizer
+        # with 0s and 1s) and treat everything as type 0. This prevents index out of bounds errors.
+        if self.token_type_embeddings.num_embeddings == 1:
+            token_type_ids = torch.zeros_like(token_type_ids)
+
         if inputs_embeds is None:
             inputs_embeds = self.word_embeddings(input_ids)
         token_type_embeddings = self.token_type_embeddings(token_type_ids)
