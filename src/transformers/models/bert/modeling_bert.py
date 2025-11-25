@@ -26,7 +26,6 @@ This is a modernized BERT implementation with the following improvements:
 """
 
 import math
-import os
 import warnings
 from dataclasses import dataclass
 from typing import Optional, Union
@@ -191,6 +190,11 @@ class BertFlexSelfAttention(nn.Module):
             raise ValueError("This modernized BERT encoder does not support cross-attention.")
         if past_key_values is not None:
             raise ValueError("This modernized BERT encoder does not support cached key/values.")
+        if output_attentions:
+            logger.warning_once(
+                "Flex attention does not support returning attention weights. `output_attentions=True` will "
+                "return `None` for attention weights."
+            )
 
         bsz, tgt_len, _ = hidden_states.size()
 
@@ -528,7 +532,7 @@ class BertEncoder(nn.Module):
 class BertPooler(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.dense = nn.Linear(config.hidden_size, config.hidden_size)
+        self.dense = nn.Linear(config.hidden_size, config.hidden_size, bias=False)
         self.activation = nn.Tanh()
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -930,6 +934,7 @@ class BertForPreTraining(BertPreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         token_type_ids: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
+        document_ids: Optional[torch.Tensor] = None,
         head_mask: Optional[torch.Tensor] = None,
         inputs_embeds: Optional[torch.Tensor] = None,
         labels: Optional[torch.Tensor] = None,
@@ -940,6 +945,9 @@ class BertForPreTraining(BertPreTrainedModel):
         **kwargs,
     ) -> Union[tuple[torch.Tensor], BertForPreTrainingOutput]:
         r"""
+        document_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
+            Document identifiers for packed inputs when using FlexAttention. Use `0` for padding positions; tokens
+            with different document IDs will not attend to each other when building the block mask.
         labels (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
             Labels for computing the masked language modeling loss. Indices should be in `[-100, 0, ...,
             config.vocab_size]` (see `input_ids` docstring) Tokens with indices set to `-100` are ignored (masked),
@@ -974,6 +982,7 @@ class BertForPreTraining(BertPreTrainedModel):
             attention_mask=attention_mask,
             token_type_ids=token_type_ids,
             position_ids=position_ids,
+            document_ids=document_ids,
             head_mask=head_mask,
             inputs_embeds=inputs_embeds,
             output_attentions=output_attentions,
