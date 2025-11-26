@@ -65,8 +65,10 @@ class BertConfig(PretrainedConfig):
         max_position_embeddings (`int`, *optional*, defaults to 512):
             The maximum sequence length that this model might ever be used with. Typically set this to something large
             just in case (e.g., 512 or 1024 or 2048).
-        type_vocab_size (`int`, *optional*, defaults to 2):
-            The vocabulary size of the `token_type_ids` passed when calling [`BertModel`] or [`TFBertModel`].
+        type_vocab_size (`int`, *optional*, defaults to 0):
+            This modernized BERT variant does NOT use token type embeddings (like ModernBERT/RoBERTa).
+            This parameter is kept for config compatibility but is ignored. The model learns to distinguish
+            sentence pairs from context and [SEP] tokens alone.
         initializer_range (`float`, *optional*, defaults to 0.02):
             The standard deviation of the truncated_normal_initializer for initializing all weight matrices.
         layer_norm_eps (`float`, *optional*, defaults to 1e-6):
@@ -111,7 +113,7 @@ class BertConfig(PretrainedConfig):
         hidden_dropout_prob=0.1,
         attention_probs_dropout_prob=0.1,
         max_position_embeddings=512,
-        type_vocab_size=2,
+        type_vocab_size=0,  # Not used - this model doesn't use token type embeddings
         initializer_range=0.02,
         layer_norm_eps=1e-6,
         pad_token_id=0,
@@ -173,11 +175,11 @@ class BertOnnxConfig(OnnxConfig):
             dynamic_axis = {0: "batch", 1: "choice", 2: "sequence"}
         else:
             dynamic_axis = {0: "batch", 1: "sequence"}
+        # No token_type_ids - this modernized BERT doesn't use them
         return OrderedDict(
             [
                 ("input_ids", dynamic_axis),
                 ("attention_mask", dynamic_axis),
-                ("token_type_ids", dynamic_axis),
             ]
         )
 
