@@ -20,7 +20,8 @@ This is a modernized BERT implementation with the following improvements:
 - SwiGLU activation in feed-forward layers for better performance
 - Flex Attention for efficient attention computation
 - Absolute position embeddings only (relative position embeddings not supported)
-- Bias-free architecture for improved stability
+- Bias-free encoder stack (Q/K/V, attention output, FFN projections have no bias;
+  task-specific heads like classifiers retain bias for fine-tuning flexibility)
 - Residual scaling for deep networks (1/sqrt(2L))
 - Packed SwiGLU projections for better performance
 """
@@ -813,11 +814,6 @@ class BertModel(BertPreTrainedModel):
         )
         embedding_output = self.embeddings_rmsnorm(embedding_output)
 
-        if attention_mask is None:
-            attention_mask = torch.ones((batch_size, seq_length + past_key_values_length), device=device)
-        else:
-            attention_mask = attention_mask.to(device)
-
         # Handle document masking for packed sequences
         # Per PyTorch FlexAttention blog: document_id indicates which document each token belongs to
         # The mask_mod in flex_attention checks: document_id[q_idx] == document_id[kv_idx]
@@ -827,13 +823,25 @@ class BertModel(BertPreTrainedModel):
             if doc_mask_source.dim() == 1:
                 doc_mask_source = doc_mask_source.unsqueeze(0)
             doc_mask_source = doc_mask_source.to(dtype=torch.long)
-            
-            # Shift document IDs by 1 so that user's [0, 0, 1, 1] becomes [1, 1, 2, 2]
-            # This ensures doc_id > 0 for all valid documents
+
+            # If attention_mask not provided, derive it from document_ids (0 = padding)
+            # This prevents padding leak where padding with doc_id=0 would become doc_id=1 after shift
+            if attention_mask is None:
+                attention_mask = (doc_mask_source > 0).to(dtype=torch.long, device=device)
+            else:
+                attention_mask = attention_mask.to(device)
+
+            # Shift document IDs by 1 so that user's [1, 1, 2, 2] becomes [2, 2, 3, 3]
+            # This ensures doc_id > 0 for all valid documents, and padding (originally 0) stays 0
+            # after multiplication with attention_mask
             doc_mask_source = (doc_mask_source + 1)
             # Apply attention_mask to set padding positions to 0 (padding should have mask 0)
             doc_mask_source = doc_mask_source * attention_mask.to(dtype=torch.long)
         else:
+            if attention_mask is None:
+                attention_mask = torch.ones((batch_size, seq_length + past_key_values_length), device=device)
+            else:
+                attention_mask = attention_mask.to(device)
             # No document_ids: all valid tokens are document 1, padding is 0
             doc_mask_source = attention_mask.to(dtype=torch.long)
 
