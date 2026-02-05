@@ -141,8 +141,7 @@ class BertConfig(PretrainedConfig):
         if position_embedding_type != "absolute":
             raise ValueError(
                 f"This modernized BERT variant only supports 'absolute' position embeddings, "
-                f"got '{position_embedding_type}'. Relative position embeddings are not supported "
-                f"with flex attention."
+                f"got '{position_embedding_type}'. Relative position embeddings are not supported."
             )
 
         self.vocab_size = vocab_size
@@ -165,7 +164,6 @@ class BertConfig(PretrainedConfig):
         self.position_embedding_type = position_embedding_type
         self.use_cache = use_cache
         self.classifier_dropout = classifier_dropout
-        self._attn_implementation = "flex_attention"
 
 
 class BertOnnxConfig(OnnxConfig):
