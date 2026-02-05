@@ -278,7 +278,9 @@ class BertFlexAttentionTest(unittest.TestCase):
             "hidden_dropout_prob": 0.0,
         }
         defaults.update(kwargs)
-        return BertConfig(**defaults)
+        config = BertConfig(**defaults)
+        config._attn_implementation = "flex_attention"
+        return config
 
     # ===== Basic Functionality Tests =====
 
@@ -870,6 +872,7 @@ class BertFlexAttentionTest(unittest.TestCase):
     def test_attention_dropout_warning(self):
         """Test that attention dropout > 0 triggers warning."""
         config = BertConfig(attention_probs_dropout_prob=0.1)
+        config._attn_implementation = "flex_attention"
         # Creating model should log warning about dropout not being supported
         model = BertModel(config).to(torch_device)
         # Verify dropout is set to 0
@@ -1220,9 +1223,294 @@ class BertFlexAttentionTest(unittest.TestCase):
 
 
 @require_torch
+class BertSdpaAttentionTest(unittest.TestCase):
+    """Tests for SDPA attention implementation."""
+
+    def _make_config(self, seq_length: int = 6, attn_implementation: str = "sdpa", **kwargs):
+        defaults = {
+            "vocab_size": 32,
+            "hidden_size": 64,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 4,
+            "max_position_embeddings": 32,
+            "attention_probs_dropout_prob": 0.0,
+            "hidden_dropout_prob": 0.0,
+        }
+        defaults.update(kwargs)
+        config = BertConfig(**defaults)
+        config._attn_implementation = attn_implementation
+        return config
+
+    # ===== Basic SDPA Functionality Tests =====
+
+    def test_sdpa_forward_pass(self):
+        """Test that SDPA forward pass works correctly."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(outputs.last_hidden_state.shape, (2, 8, config.hidden_size))
+        self.assertIsNotNone(outputs.pooler_output)
+        self.assertFalse(torch.isnan(outputs.last_hidden_state).any())
+
+    def test_sdpa_with_attention_mask(self):
+        """Test SDPA correctly handles attention masks."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+        # Mask out last 2 positions
+        attention_mask = torch.tensor([
+            [1, 1, 1, 1, 1, 1, 0, 0],
+            [1, 1, 1, 1, 0, 0, 0, 0],
+        ], device=torch_device)
+
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(outputs.last_hidden_state.shape, (2, 8, config.hidden_size))
+        self.assertFalse(torch.isnan(outputs.last_hidden_state).any())
+
+    def test_sdpa_backward_runs(self):
+        """Test that gradients flow correctly through SDPA."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.train()
+
+        input_ids = ids_tensor([2, 5], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        loss = outputs.last_hidden_state.sum()
+        loss.backward()
+
+        # Verify gradients populated
+        self.assertIsNotNone(model.embeddings.word_embeddings.weight.grad)
+        self.assertIsNotNone(model.encoder.layer[0].attention.self.query.weight.grad)
+
+    def test_sdpa_no_attention_mask(self):
+        """Test SDPA works without attention mask (all tokens attend to all)."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        input_ids = ids_tensor([2, 6], config.vocab_size).to(torch_device)
+
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids)
+
+        self.assertEqual(outputs.last_hidden_state.shape, (2, 6, config.hidden_size))
+        self.assertFalse(torch.isnan(outputs.last_hidden_state).any())
+
+    # ===== SDPA vs FlexAttention Consistency Tests =====
+
+    def test_sdpa_flex_attention_similar_outputs(self):
+        """Test that SDPA and FlexAttention produce similar outputs for simple cases."""
+        config_sdpa = self._make_config(attn_implementation="sdpa")
+        config_flex = self._make_config(attn_implementation="flex_attention")
+
+        # Create two models with same weights
+        model_sdpa = BertModel(config_sdpa).to(torch_device)
+        model_flex = BertModel(config_flex).to(torch_device)
+
+        # Copy weights from sdpa to flex
+        model_flex.load_state_dict(model_sdpa.state_dict())
+
+        model_sdpa.eval()
+        model_flex.eval()
+
+        input_ids = ids_tensor([2, 6], config_sdpa.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        with torch.no_grad():
+            out_sdpa = model_sdpa(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+            out_flex = model_flex(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+        # Outputs should be very close (not exact due to different code paths)
+        torch.testing.assert_close(out_sdpa, out_flex, rtol=1e-4, atol=1e-4)
+
+    # ===== SDPA Document IDs Warning Test =====
+
+    def test_sdpa_document_ids_warning(self):
+        """Test that document_ids produces a warning with SDPA."""
+        config = self._make_config()
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        input_ids = ids_tensor([1, 6], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+        document_ids = torch.tensor([[0, 0, 0, 1, 1, 1]], device=torch_device)
+
+        logger = logging.get_logger("transformers.models.bert.modeling_bert")
+        logger.warning_once.cache_clear()
+
+        with CaptureLogger(logger) as cl:
+            with torch.no_grad():
+                model(input_ids=input_ids, attention_mask=attention_mask, document_ids=document_ids)
+
+        self.assertIn("document_ids", cl.out)
+        self.assertIn("FlexAttention", cl.out)
+
+    # ===== SDPA Attention Implementation Selection Tests =====
+
+    def test_sdpa_attention_class_selection(self):
+        """Test that SDPA attention class is correctly selected."""
+        from transformers.models.bert.modeling_bert import BertSdpaSelfAttention
+
+        config = self._make_config(attn_implementation="sdpa")
+        model = BertModel(config).to(torch_device)
+
+        # Check that attention layers use SDPA
+        for layer in model.encoder.layer:
+            self.assertIsInstance(layer.attention.self, BertSdpaSelfAttention)
+
+    def test_flex_attention_class_selection(self):
+        """Test that FlexAttention class is correctly selected."""
+        from transformers.models.bert.modeling_bert import BertFlexSelfAttention
+
+        config = self._make_config(attn_implementation="flex_attention")
+        model = BertModel(config).to(torch_device)
+
+        # Check that attention layers use FlexAttention
+        for layer in model.encoder.layer:
+            self.assertIsInstance(layer.attention.self, BertFlexSelfAttention)
+
+    # ===== SDPA Model Variants Tests =====
+
+    def test_sdpa_masked_lm_model(self):
+        """Test SDPA with BertForMaskedLM."""
+        config = self._make_config(attn_implementation="sdpa")
+        model = BertForMaskedLM(config).to(torch_device)
+        model.eval()
+
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(outputs.logits.shape, (2, 8, config.vocab_size))
+
+    def test_sdpa_sequence_classification_model(self):
+        """Test SDPA with BertForSequenceClassification."""
+        config = self._make_config(attn_implementation="sdpa")
+        config.num_labels = 3
+        model = BertForSequenceClassification(config).to(torch_device)
+        model.eval()
+
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(outputs.logits.shape, (2, 3))
+
+    def test_sdpa_token_classification_model(self):
+        """Test SDPA with BertForTokenClassification."""
+        config = self._make_config(attn_implementation="sdpa")
+        config.num_labels = 5
+        model = BertForTokenClassification(config).to(torch_device)
+        model.eval()
+
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        with torch.no_grad():
+            outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(outputs.logits.shape, (2, 8, 5))
+
+    # ===== SDPA with Gradient Checkpointing =====
+
+    def test_sdpa_gradient_checkpointing(self):
+        """Test SDPA with gradient checkpointing enabled."""
+        config = self._make_config(attn_implementation="sdpa")
+        model = BertModel(config).to(torch_device)
+        model.gradient_checkpointing_enable()
+        model.train()
+
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+        loss = outputs.last_hidden_state.sum()
+        loss.backward()
+
+        self.assertIsNotNone(model.embeddings.word_embeddings.weight.grad)
+
+    # ===== SDPA Numerical Stability Tests =====
+
+    def test_sdpa_mixed_precision(self):
+        """Test SDPA works correctly with mixed precision."""
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA not available for mixed precision test")
+
+        config = self._make_config(attn_implementation="sdpa")
+        model = BertModel(config).to("cuda")
+        model.eval()
+
+        input_ids = ids_tensor([2, 8], config.vocab_size).to("cuda")
+        attention_mask = torch.ones_like(input_ids)
+
+        with torch.no_grad():
+            with torch.amp.autocast("cuda", dtype=torch.float16):
+                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
+
+        self.assertEqual(outputs.last_hidden_state.shape, (2, 8, config.hidden_size))
+        self.assertFalse(torch.isnan(outputs.last_hidden_state).any())
+
+    def test_sdpa_attention_dropout_training(self):
+        """Test that SDPA applies dropout during training."""
+        config = self._make_config(attention_probs_dropout_prob=0.1, attn_implementation="sdpa")
+        model = BertModel(config).to(torch_device)
+        model.train()
+
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        # Run forward twice - with dropout, outputs should differ
+        torch.manual_seed(42)
+        out1 = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+        torch.manual_seed(123)
+        out2 = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+        # Outputs should be different due to dropout
+        self.assertFalse(torch.allclose(out1, out2))
+
+    def test_sdpa_no_dropout_eval(self):
+        """Test that SDPA does not apply dropout during evaluation."""
+        config = self._make_config(attention_probs_dropout_prob=0.5, attn_implementation="sdpa")
+        model = BertModel(config).to(torch_device)
+        model.eval()
+
+        input_ids = ids_tensor([2, 8], config.vocab_size).to(torch_device)
+        attention_mask = torch.ones_like(input_ids)
+
+        # Run forward twice - without dropout (eval mode), outputs should be identical
+        with torch.no_grad():
+            torch.manual_seed(42)
+            out1 = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+            torch.manual_seed(123)
+            out2 = model(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+
+        # Outputs should be identical in eval mode
+        torch.testing.assert_close(out1, out2)
+
+
+@require_torch
 class BertModelIntegrationTest(unittest.TestCase):
-    def _make_config(self, **kwargs):
-        return BertConfig(
+    def _make_config(self, attn_implementation: str = "flex_attention", **kwargs):
+        config = BertConfig(
             vocab_size=128,
             hidden_size=64,
             num_hidden_layers=2,
@@ -1231,6 +1519,8 @@ class BertModelIntegrationTest(unittest.TestCase):
             attention_probs_dropout_prob=0.0,
             hidden_dropout_prob=0.0,
         )
+        config._attn_implementation = attn_implementation
+        return config
 
     @slow
     def test_inference_no_head_absolute_embedding(self):
