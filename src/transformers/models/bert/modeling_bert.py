@@ -39,6 +39,7 @@ from ...activations import ACT2FN
 from ...cache_utils import Cache, DynamicCache, EncoderDecoderCache
 from ...generation import GenerationMixin
 from ...integrations.flex_attention import BlockMask, flex_attention_forward, make_flex_block_causal_mask
+from ...integrations.sdpa_attention import sdpa_attention_forward
 from ...modeling_layers import GradientCheckpointingLayer
 from ...modeling_outputs import (
     BaseModelOutputWithPastAndCrossAttentions,
@@ -227,6 +228,106 @@ class BertFlexSelfAttention(nn.Module):
         return attn_output, None
 
 
+class BertSdpaSelfAttention(nn.Module):
+    """SDPA-based self-attention for efficient fine-tuning without document packing.
+    
+    This is faster than FlexAttention for standard fine-tuning tasks because:
+    - No block mask compilation overhead
+    - Uses PyTorch's optimized Flash Attention / Memory Efficient kernels
+    - No per-forward mask recreation
+    
+    Use FlexAttention instead if you need document packing during pre-training.
+    """
+
+    def __init__(self, config, position_embedding_type=None, layer_idx=None):
+        super().__init__()
+        if config.hidden_size % config.num_attention_heads != 0 and not hasattr(config, "embedding_size"):
+            raise ValueError(
+                f"The hidden size ({config.hidden_size}) is not a multiple of the number of attention "
+                f"heads ({config.num_attention_heads})"
+            )
+
+        if position_embedding_type is not None and position_embedding_type != "absolute":
+            raise ValueError(
+                f"This BERT variant only supports 'absolute' position embeddings, got '{position_embedding_type}'."
+            )
+        self.position_embedding_type = "absolute"
+
+        self.num_attention_heads = config.num_attention_heads
+        self.attention_head_size = int(config.hidden_size / config.num_attention_heads)
+        self.all_head_size = self.num_attention_heads * self.attention_head_size
+
+        self.query = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
+        self.key = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
+        self.value = nn.Linear(config.hidden_size, self.all_head_size, bias=False)
+
+        self.scaling = self.attention_head_size**-0.5
+        self.dropout_prob = config.attention_probs_dropout_prob
+        self.is_causal = False  # BERT is bidirectional encoder
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        head_mask: Optional[torch.FloatTensor] = None,
+        encoder_hidden_states: Optional[torch.FloatTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        output_attentions: Optional[bool] = False,
+        cache_position: Optional[torch.Tensor] = None,
+        block_mask: Optional[BlockMask] = None,
+    ) -> tuple[torch.Tensor, None]:
+        if encoder_hidden_states is not None:
+            raise ValueError("This modernized BERT encoder does not support cross-attention.")
+        if past_key_values is not None:
+            raise ValueError("This modernized BERT encoder does not support cached key/values.")
+        if output_attentions:
+            logger.warning_once(
+                "SDPA attention does not support returning attention weights. `output_attentions=True` will "
+                "return `None` for attention weights."
+            )
+
+        bsz, tgt_len, _ = hidden_states.size()
+
+        query_layer = (
+            self.query(hidden_states)
+            .view(bsz, tgt_len, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        key_layer = (
+            self.key(hidden_states)
+            .view(bsz, tgt_len, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+        value_layer = (
+            self.value(hidden_states)
+            .view(bsz, tgt_len, self.num_attention_heads, self.attention_head_size)
+            .transpose(1, 2)
+        )
+
+        # Convert attention_mask from [batch, seq] to [batch, 1, 1, seq] for SDPA
+        # SDPA expects: 0 = attend, -inf = mask
+        if attention_mask is not None:
+            # attention_mask is [batch, seq] with 1 = attend, 0 = mask
+            # Convert to [batch, 1, 1, seq] with 0 = attend, -inf = mask
+            attention_mask = attention_mask[:, None, None, :].to(dtype=query_layer.dtype)
+            attention_mask = (1.0 - attention_mask) * torch.finfo(query_layer.dtype).min
+
+        attn_output, _ = sdpa_attention_forward(
+            self,
+            query_layer,
+            key_layer,
+            value_layer,
+            attention_mask=attention_mask,
+            dropout=self.dropout_prob if self.training else 0.0,
+            scaling=self.scaling,
+            is_causal=self.is_causal,
+        )
+
+        attn_output = attn_output.reshape(bsz, tgt_len, self.all_head_size)
+
+        return attn_output, None
+
+
 class BertSelfOutput(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -243,6 +344,7 @@ class BertSelfOutput(nn.Module):
 
 BERT_SELF_ATTENTION_CLASSES = {
     "flex_attention": BertFlexSelfAttention,
+    "sdpa": BertSdpaSelfAttention,
 }
 
 
@@ -607,7 +709,7 @@ class BertPreTrainedModel(PreTrainedModel):
     config: BertConfig
     base_model_prefix = "bert"
     supports_gradient_checkpointing = True
-    _supports_sdpa = False
+    _supports_sdpa = True
     _supports_flex_attn = True
 
     def _init_weights(self, module):
@@ -739,8 +841,9 @@ class BertModel(BertPreTrainedModel):
     ) -> Union[tuple[torch.Tensor], BaseModelOutputWithPoolingAndCrossAttentions]:
         r"""
         document_ids (`torch.LongTensor` of shape `(batch_size, sequence_length)`, *optional*):
-            Document identifiers for packed inputs when using FlexAttention. Use `0` for padding positions; tokens
-            with different document IDs will not attend to each other when building the block mask.
+            Document identifiers for packed inputs when using FlexAttention (`attn_implementation='flex_attention'`).
+            Use `0` for padding positions; tokens with different document IDs will not attend to each other when
+            building the block mask. This is ignored when using SDPA attention.
         """
         if encoder_hidden_states is not None or self.config.add_cross_attention or self.config.is_decoder:
             raise ValueError("Cross-attention/decoder use is not supported in this modernized BERT variant.")
@@ -782,29 +885,75 @@ class BertModel(BertPreTrainedModel):
                 else past_key_values.get_seq_length()
             )
 
-        # Automatic Position ID Generation for Packed Sequences
-        if position_ids is None:
+        # For SDPA: Simple path - no document packing support, skip expensive operations
+        # For FlexAttention: Full document packing with position ID recomputation
+        if self.attn_implementation == "sdpa":
+            # SDPA path: simple attention mask handling, no document packing
             if document_ids is not None:
-                doc_ids_for_pos = document_ids
-            elif attention_mask is not None and (attention_mask > 1).any():
-                doc_ids_for_pos = attention_mask
+                logger.warning_once(
+                    "`document_ids` is only supported with FlexAttention. "
+                    "Ignoring document_ids for SDPA attention. Use `attn_implementation='flex_attention'` "
+                    "for document packing during pre-training."
+                )
+            if attention_mask is None:
+                attention_mask = torch.ones((batch_size, seq_length), device=device, dtype=torch.long)
             else:
-                doc_ids_for_pos = None
+                attention_mask = attention_mask.to(device=device, dtype=torch.long)
+            # position_ids=None lets embeddings layer use default sequential positions
+            block_mask = None
+        else:
+            # FlexAttention path: full document packing support
+            # Automatic Position ID Generation for Packed Sequences
+            if position_ids is None:
+                if document_ids is not None:
+                    doc_ids_for_pos = document_ids
+                elif attention_mask is not None and (attention_mask > 1).any():
+                    doc_ids_for_pos = attention_mask
+                else:
+                    doc_ids_for_pos = None
 
-            if doc_ids_for_pos is not None:
-                doc_ids_for_pos = doc_ids_for_pos.to(device).long()
-                doc_ids_shifted = doc_ids_for_pos.roll(1, 1)
-                doc_ids_shifted[:, 0] = -1
-                is_boundary = (doc_ids_for_pos != doc_ids_shifted)
-                indices = torch.arange(seq_length, device=device).unsqueeze(0)
-                boundary_indices = (indices * is_boundary.long())
-                doc_starts = boundary_indices.cummax(dim=1).values
-                position_ids = (indices - doc_starts).long()
-                
-                # Mask position_ids for padding
-                # Use attention_mask if available to identify padding
-                if attention_mask is not None:
-                    position_ids = position_ids * attention_mask.to(dtype=torch.long)
+                if doc_ids_for_pos is not None:
+                    doc_ids_for_pos = doc_ids_for_pos.to(device).long()
+                    doc_ids_shifted = doc_ids_for_pos.roll(1, 1)
+                    doc_ids_shifted[:, 0] = -1
+                    is_boundary = (doc_ids_for_pos != doc_ids_shifted)
+                    indices = torch.arange(seq_length, device=device).unsqueeze(0)
+                    boundary_indices = (indices * is_boundary.long())
+                    doc_starts = boundary_indices.cummax(dim=1).values
+                    position_ids = (indices - doc_starts).long()
+                    
+                    # Mask position_ids for padding
+                    if attention_mask is not None:
+                        position_ids = position_ids * attention_mask.to(dtype=torch.long)
+
+            # Handle document masking for packed sequences
+            # Per PyTorch FlexAttention blog: document_id indicates which document each token belongs to
+            if document_ids is not None:
+                doc_mask_source = document_ids.to(device)
+                if doc_mask_source.dim() == 1:
+                    doc_mask_source = doc_mask_source.unsqueeze(0)
+                doc_mask_source = doc_mask_source.to(dtype=torch.long)
+
+                if attention_mask is None:
+                    attention_mask = (doc_mask_source > 0).to(dtype=torch.long, device=device)
+                else:
+                    attention_mask = attention_mask.to(device)
+
+                # Shift document IDs by 1 so padding stays 0
+                doc_mask_source = (doc_mask_source + 1) * attention_mask.to(dtype=torch.long)
+            else:
+                if attention_mask is None:
+                    attention_mask = torch.ones((batch_size, seq_length + past_key_values_length), device=device, dtype=torch.long)
+                else:
+                    attention_mask = attention_mask.to(device=device, dtype=torch.long)
+                doc_mask_source = attention_mask
+
+            block_mask = make_flex_block_causal_mask(
+                doc_mask_source,
+                query_length=seq_length + past_key_values_length,
+                key_length=seq_length + past_key_values_length,
+                is_causal=self.config.is_decoder,
+            )
 
         embedding_output = self.embeddings(
             input_ids=input_ids,
@@ -814,49 +963,11 @@ class BertModel(BertPreTrainedModel):
         )
         embedding_output = self.embeddings_rmsnorm(embedding_output)
 
-        # Handle document masking for packed sequences
-        # Per PyTorch FlexAttention blog: document_id indicates which document each token belongs to
-        # The mask_mod in flex_attention checks: document_id[q_idx] == document_id[kv_idx]
-        # Valid tokens must have doc_id > 0, padding must be 0 (so they don't match any valid doc)
-        if document_ids is not None:
-            doc_mask_source = document_ids.to(device)
-            if doc_mask_source.dim() == 1:
-                doc_mask_source = doc_mask_source.unsqueeze(0)
-            doc_mask_source = doc_mask_source.to(dtype=torch.long)
-
-            # If attention_mask not provided, derive it from document_ids (0 = padding)
-            # This prevents padding leak where padding with doc_id=0 would become doc_id=1 after shift
-            if attention_mask is None:
-                attention_mask = (doc_mask_source > 0).to(dtype=torch.long, device=device)
-            else:
-                attention_mask = attention_mask.to(device)
-
-            # Shift document IDs by 1 so that user's [1, 1, 2, 2] becomes [2, 2, 3, 3]
-            # This ensures doc_id > 0 for all valid documents, and padding (originally 0) stays 0
-            # after multiplication with attention_mask
-            doc_mask_source = (doc_mask_source + 1)
-            # Apply attention_mask to set padding positions to 0 (padding should have mask 0)
-            doc_mask_source = doc_mask_source * attention_mask.to(dtype=torch.long)
-        else:
-            if attention_mask is None:
-                attention_mask = torch.ones((batch_size, seq_length + past_key_values_length), device=device)
-            else:
-                attention_mask = attention_mask.to(device)
-            # No document_ids: all valid tokens are document 1, padding is 0
-            doc_mask_source = attention_mask.to(dtype=torch.long)
-
-        block_mask = make_flex_block_causal_mask(
-            doc_mask_source,
-            query_length=seq_length + past_key_values_length,
-            key_length=seq_length + past_key_values_length,
-            is_causal=self.config.is_decoder,
-        )
-
         head_mask = None
 
         encoder_outputs = self.encoder(
             embedding_output,
-            attention_mask=None,
+            attention_mask=attention_mask,  # Pass attention_mask for SDPA
             head_mask=head_mask,
             encoder_hidden_states=encoder_hidden_states,
             encoder_attention_mask=None,
